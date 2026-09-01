@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual Environments
+.env
+.venv
+env/
+venv/
+
+# Testing & Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Experiments & Data
+runs/
+logs/
+*.log
+*.sqlite
