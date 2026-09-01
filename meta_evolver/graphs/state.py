@@ -100,6 +100,9 @@ class EpisodeState(TypedDict, total=False):
     """Echoed back on the ToolMessage. A tool result whose id does not match
     the call that produced it is rejected by every provider."""
     nudges: int
+    assertion_retries: int
+    assertion_warnings: list[str]
+    pending_assertion_failures: list[str]
     terminated: bool
     truncated: bool
     reward: float
