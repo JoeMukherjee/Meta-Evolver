@@ -20,8 +20,11 @@ import json
 import re
 from collections.abc import Sequence
 
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import HumanMessage, SystemMessage
+
 from meta_evolver.core.types import MemoryItem, Trajectory
-from meta_evolver.llm.client import BaseLLMClient, LLMError
+from meta_evolver.llm.client import LLMError, invoke_text
 
 INDUCTION_SYSTEM = """\
 You distil agent execution traces into reusable strategy memories for future agents.
@@ -68,12 +71,12 @@ class MemoryInducer:
 
     def __init__(
         self,
-        client: BaseLLMClient,
+        model: BaseChatModel,
         max_items_per_batch: int = 3,
         max_traces_in_prompt: int = 6,
         max_steps_per_trace: int = 14,
     ) -> None:
-        self.client = client
+        self.model = model
         self.max_items_per_batch = int(max_items_per_batch)
         self.max_traces_in_prompt = int(max_traces_in_prompt)
         self.max_steps_per_trace = int(max_steps_per_trace)
@@ -115,18 +118,15 @@ class MemoryInducer:
         )
 
         try:
-            resp = self.client.complete(
-                messages=[
-                    {"role": "system", "content": INDUCTION_SYSTEM},
-                    {"role": "user", "content": prompt},
-                ],
-                response_format={"type": "json_object"},
+            content = invoke_text(
+                self.model,
+                [SystemMessage(content=INDUCTION_SYSTEM), HumanMessage(content=prompt)],
             )
         except LLMError as exc:
             self.last_error = str(exc)
             return []
 
-        payload = _parse_json_object(resp.content)
+        payload = _parse_json_object(content)
         if not payload:
             self.last_error = "induction returned unparseable JSON"
             return []

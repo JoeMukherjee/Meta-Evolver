@@ -41,7 +41,7 @@ from meta_evolver.core.types import (
 from meta_evolver.graphs.episode import build_episode_graph, run_episode
 from meta_evolver.graphs.evolution import EvolutionConfig, build_evolution_graph
 from meta_evolver.harness.curriculum import Curriculum
-from meta_evolver.llm.client import LiteLLMClient, ScriptedLLMClient
+from meta_evolver.llm.client import ScriptedChatModel, build_chat_model, tool_call_message
 from meta_evolver.memory.bank import ReasoningMemoryBank
 
 __version__ = "0.2.0"
@@ -57,22 +57,23 @@ __all__ = [
     "EvaluationResult",
     "EvolutionConfig",
     "GenerationReport",
-    "LiteLLMClient",
     "MemoryItem",
     "MetaEvolver",
     "Observation",
     "ReasoningMemoryBank",
     "Rules",
-    "ScriptedLLMClient",
+    "ScriptedChatModel",
     "StepRecord",
     "TaskSpec",
     "Trajectory",
+    "build_chat_model",
     "build_episode_graph",
     "build_evolution_graph",
     "get_benchmark",
     "list_benchmarks",
     "register_benchmark",
     "run_episode",
+    "tool_call_message",
     "tool_schema",
     "__version__",
 ]

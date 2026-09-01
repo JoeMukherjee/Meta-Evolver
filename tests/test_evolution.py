@@ -1,17 +1,19 @@
 """The outer loop: memory curation, prompt selection, curriculum, reporting.
 
-Runs the whole evolution graph against scripted models, so the coupling
+Runs the whole evolution graph against scripted chat models, so the coupling
 between the three improvement channels is exercised without a network call.
 """
 from __future__ import annotations
 
 import json
 
+from langchain_core.messages import AIMessage
+
 from meta_evolver.core.evolver import MetaEvolver
 from meta_evolver.core.registry import get_benchmark
 from meta_evolver.graphs.evolution import EvolutionConfig
 from meta_evolver.harness.curriculum import Curriculum
-from meta_evolver.llm.client import LLMResponse, ScriptedLLMClient, ToolCall
+from meta_evolver.llm.client import ScriptedChatModel, tool_call_message
 from meta_evolver.memory.bank import ReasoningMemoryBank
 
 INDUCED = json.dumps(
@@ -30,12 +32,6 @@ INDUCED = json.dumps(
 )
 
 
-def _call(name, **kwargs):
-    return LLMResponse(
-        content="", tool_calls=[ToolCall(id=f"c-{name}", name=name, arguments=kwargs)]
-    )
-
-
 def _goal_for(text: str):
     """Read the intended fix out of the incident text.
 
@@ -43,70 +39,77 @@ def _goal_for(text: str):
     exercise the loop rather than a single hand-written trajectory.
     """
     if "401" in text or "Unauthorized" in text:
-        return "auth-service", "active_key_version", "v2"
+        return "auth-service", {"active_key_version": "v2"}
     if "cache" in text.lower():
-        return "cache-worker", "ttl_seconds", 600
+        return "cache-worker", {"ttl_seconds": 600, "eviction_policy": "allkeys-lru"}
     if "429" in text:
-        return "sync-worker", "poll_interval_ms", 2000
+        return "sync-worker", {"poll_interval_ms": 2000}
     if "space left" in text or "ingest" in text:
-        return "log-shipper", "retention_days", 14
-    return "db-proxy", "max_connections", 50
+        return "log-shipper", {"retention_days": 14}
+    return "db-proxy", {"max_connections": 50}
 
 
 def agent_responder(messages, tools):
     """A competent agent, driven by which tools it has already used."""
     used = {
-        m["tool_calls"][0]["function"]["name"]
+        call["name"]
         for m in messages
-        if m.get("role") == "assistant" and m.get("tool_calls")
+        for call in (getattr(m, "tool_calls", None) or [])
     }
-    text = " ".join(str(m.get("content", "")) for m in messages)
-    target, key, value = _goal_for(text)
+    text = " ".join(str(getattr(m, "content", "")) for m in messages)
+    target, patch = _goal_for(text)
 
     if "inspect_service_logs" not in used:
-        return _call("inspect_service_logs", service_name=target)
+        return tool_call_message("inspect_service_logs", service_name=target)
     if "patch_service_config" not in used:
-        patch = {key: value}
-        if target == "cache-worker":
-            patch["eviction_policy"] = "allkeys-lru"
-        return _call("patch_service_config", service_name=target, config_patch=patch)
+        return tool_call_message(
+            "patch_service_config", service_name=target, config_patch=patch
+        )
     if "restart_service" not in used:
-        return _call("restart_service", service_name=target)
+        return tool_call_message("restart_service", service_name=target)
     if "run_healthcheck" not in used:
-        return _call("run_healthcheck", endpoint="health")
-    return _call(
+        return tool_call_message("run_healthcheck", endpoint="health")
+    return tool_call_message(
         "submit_resolution", root_cause="diagnosed", action_taken="patched and restarted"
     )
 
 
-class DualClient(ScriptedLLMClient):
-    """One client playing the agent, the inducer and the optimizer.
+class DualModel(ScriptedChatModel):
+    """One model playing the agent, the inducer and the optimizer.
 
     Which role a call belongs to is decided by its system prompt -- which is
     how the real system distinguishes them too.
     """
 
-    def __init__(self):
-        super().__init__(responder=lambda m, t: LLMResponse())
+    n_induction: int = 0
+    n_optimization: int = 0
+
+    def __init__(self, **kwargs):
+        super().__init__(responder=lambda m, t: AIMessage(content=""), **kwargs)
         self.n_induction = 0
         self.n_optimization = 0
 
-    def complete(self, messages, tools=None, response_format=None, max_tokens=None, **kwargs):
-        self.calls.append(list(messages))
-        system = str(messages[0].get("content", "")) if messages else ""
+    def _reply(self, messages):
+        system = str(getattr(messages[0], "content", "")) if messages else ""
         if "distil agent execution traces" in system:
             self.n_induction += 1
-            return LLMResponse(content=INDUCED)
+            return AIMessage(content=INDUCED)
         if "improve the system instructions" in system:
             self.n_optimization += 1
-            return LLMResponse(
+            return AIMessage(
                 content=(
                     "You are a disciplined incident-response agent. Confirm the owning "
                     "service before patching, restart it, and submit only after the "
                     "healthcheck returns 200.\n\n{memory_section}\n{guidance_section}"
                 )
             )
-        return agent_responder(list(messages), tools)
+        return agent_responder(messages, self.bound_tools)
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        from langchain_core.outputs import ChatGeneration, ChatResult
+
+        self.calls.append(list(messages))
+        return ChatResult(generations=[ChatGeneration(message=self._reply(list(messages)))])
 
 
 def build(**overrides) -> MetaEvolver:
@@ -120,7 +123,7 @@ def build(**overrides) -> MetaEvolver:
     config = EvolutionConfig(**{**defaults, **overrides})
     return MetaEvolver(
         benchmark="devops",
-        client=DualClient(),
+        chat_model=DualModel(),
         bank=ReasoningMemoryBank(),
         config=config,
         curriculum=Curriculum(enabled=config.curriculum),
@@ -161,26 +164,25 @@ def test_prompt_optimization_is_skipped_when_nothing_fails():
     evolver = build()
     evolver.evolve()
 
-    assert evolver.client.n_optimization == 0
+    assert evolver.model.n_optimization == 0
     assert evolver.prompt_version == "base"
 
 
 def test_prompt_is_only_adopted_after_beating_the_incumbent():
     """A proposal is a hypothesis; validation is what makes it an improvement."""
 
-    class WeakClient(DualClient):
-        def complete(self, messages, tools=None, response_format=None, max_tokens=None, **kw):
-            system = str(messages[0].get("content", "")) if messages else ""
+    class WeakModel(DualModel):
+        def _reply(self, messages):
+            system = str(getattr(messages[0], "content", "")) if messages else ""
             if "distil" in system or "improve the system instructions" in system:
-                return super().complete(messages, tools, response_format, max_tokens, **kw)
+                return super()._reply(messages)
             # An agent that only ever reads logs: every task fails, so the
             # optimizer runs -- and its candidate cannot validate any better.
-            self.calls.append(list(messages))
-            return _call("inspect_service_logs", service_name="db-proxy")
+            return tool_call_message("inspect_service_logs", service_name="db-proxy")
 
     evolver = MetaEvolver(
         benchmark="devops",
-        client=WeakClient(),
+        chat_model=WeakModel(),
         bank=ReasoningMemoryBank(),
         config=EvolutionConfig(
             generations=1,
@@ -194,7 +196,7 @@ def test_prompt_is_only_adopted_after_beating_the_incumbent():
     )
     reports = evolver.evolve()
 
-    assert evolver.client.n_optimization > 0, "failures must trigger a proposal"
+    assert evolver.model.n_optimization > 0, "failures must trigger a proposal"
     assert reports[0].validation_pass_rate is not None
     assert evolver.prompt_version == "base", "a candidate that ties must not be adopted"
     assert "kept incumbent" in " ".join(reports[0].notes)
@@ -240,6 +242,19 @@ def test_memory_ablation_is_measurable():
 
     assert with_memory["use_memory"] and not without["use_memory"]
     assert set(with_memory) == set(without)
+
+
+def test_embeddings_are_independent_of_the_chat_model():
+    """A scripted chat model must not disable retrieval.
+
+    Embeddings are their own model. Deriving them from the chat client -- as
+    an earlier version did -- means every offline run silently loses the
+    remote embedding path, and a chat-provider switch re-embeds an existing
+    bank into a different vector space.
+    """
+    evolver = build()
+    assert evolver.embedder is not None
+    assert evolver.bank.embedder is evolver.embedder
 
 
 def test_validation_split_never_leaks_into_training():

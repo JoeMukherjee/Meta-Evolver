@@ -168,7 +168,7 @@ class _FixedEmbedder(Embedder):
     """Embedder returning one constant query vector."""
 
     def __init__(self, vector):
-        super().__init__(client=None)
+        super().__init__(embeddings=None)
         self.vector = vector
 
     def embed(self, texts):

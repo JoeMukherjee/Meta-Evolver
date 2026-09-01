@@ -25,6 +25,10 @@ nodes knowing about it.
 ``adapt`` is the node that earns the structure. It runs after every action,
 owns the entire OOD-mitigation policy, and communicates with ``think`` only
 through state.
+
+Messages are LangChain ``AnyMessage`` objects under the ``add_messages``
+reducer, so tool calls arrive already normalized on ``AIMessage.tool_calls``
+and nothing here re-implements a provider's wire format.
 """
 from __future__ import annotations
 
@@ -33,6 +37,8 @@ import time
 from collections.abc import Sequence
 from typing import Any, Literal
 
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langgraph.graph import END, START, StateGraph
 
 from meta_evolver.adaptive.controller import (
@@ -41,7 +47,7 @@ from meta_evolver.adaptive.controller import (
 )
 from meta_evolver.core.types import Action, StepRecord, Trajectory
 from meta_evolver.graphs.state import EpisodeState
-from meta_evolver.llm.client import BaseLLMClient, LLMError
+from meta_evolver.llm.client import message_text
 from meta_evolver.memory.bank import ReasoningMemoryBank
 from meta_evolver.prompts.templates import render_system_prompt
 from meta_evolver.tools.routing import ToolRouter
@@ -52,7 +58,7 @@ MAX_NUDGES = 3
 
 
 def build_episode_graph(
-    client: BaseLLMClient,
+    model: BaseChatModel,
     bank: ReasoningMemoryBank | None = None,
     retrieval_k: int = 4,
     retrieval_mode: str = "mmr",
@@ -62,8 +68,9 @@ def build_episode_graph(
 ):
     """Compile the episode graph.
 
-    Live handles are closed over rather than placed in state: they are not
-    serializable, and a checkpointer would choke on them.
+    Live handles -- the chat model, the bank -- are closed over rather than
+    placed in state: they are not serializable, and a checkpointer would choke
+    on them.
 
     ``tool_router`` is optional. Supply one when the environment exposes a
     large registry and most of it is irrelevant to any single task; without it
@@ -102,10 +109,12 @@ def build_episode_graph(
             "admissible": _admissible(obs),
             "retrieved_memory_ids": [m.id for m in retrieved],
             "messages": [
-                {
-                    "role": "user",
-                    "content": f"Task: {instruction}\n\nCurrent observation:\n{obs.text[:observation_chars]}",
-                }
+                HumanMessage(
+                    content=(
+                        f"Task: {instruction}\n\n"
+                        f"Current observation:\n{obs.text[:observation_chars]}"
+                    )
+                )
             ],
             "steps": [],
             "step_idx": 0,
@@ -134,7 +143,7 @@ def build_episode_graph(
             memory_section=controller.memory_block(),
             guidance_section=controller.guidance_block(state.get("admissible")),
         )
-        messages = [{"role": "system", "content": system}, *state["messages"]]
+        messages = [SystemMessage(content=system), *state["messages"]]
 
         tools = env.available_tools()
         if tool_router is not None:
@@ -146,25 +155,26 @@ def build_episode_graph(
             tools = tool_router.select(tools, query)
 
         try:
-            resp = client.complete(messages=messages, tools=tools)
-        except LLMError as exc:
+            reply = model.bind_tools(tools).invoke(messages)
+        except Exception as exc:
             # An infrastructure failure is not a task failure. Recording it as
             # `error` keeps it out of the learning signal downstream.
-            return {"error": f"llm: {exc}", "terminated": True}
+            return {"error": f"llm: {type(exc).__name__}: {exc}", "terminated": True}
 
-        tokens = state.get("tokens", 0) + resp.tokens
-        if not resp.has_tool_calls:
-            return {
-                "pending_action": None,
-                "pending_thought": resp.content,
-                "tokens": tokens,
-            }
+        thought = message_text(reply)
+        tokens = state.get("tokens", 0) + _token_count(reply)
 
-        call = resp.tool_calls[0]
+        if not reply.tool_calls:
+            # The reply is not appended here: `nudge` owns that, so a prose
+            # turn produces exactly one assistant message in the transcript.
+            return {"pending_action": None, "pending_thought": thought, "tokens": tokens}
+
+        call = reply.tool_calls[0]
         return {
-            "pending_action": {"name": call.name, "kwargs": call.arguments},
-            "pending_thought": resp.content,
-            "pending_tool_call_id": call.id,
+            "messages": [reply],
+            "pending_action": {"name": call["name"], "kwargs": call.get("args") or {}},
+            "pending_thought": thought,
+            "pending_tool_call_id": call.get("id") or f"call_{state.get('step_idx', 0) + 1}",
             "tokens": tokens,
             "nudges": 0,
         }
@@ -175,14 +185,13 @@ def build_episode_graph(
         return {
             "nudges": state.get("nudges", 0) + 1,
             "messages": [
-                {"role": "assistant", "content": thought or "(no content)"},
-                {
-                    "role": "user",
-                    "content": (
+                AIMessage(content=thought or "(no content)"),
+                HumanMessage(
+                    content=(
                         "Respond with a tool call, not prose. Choose the single "
                         "action that best advances the task from the current state."
-                    ),
-                },
+                    )
+                ),
             ],
         }
 
@@ -192,6 +201,7 @@ def build_episode_graph(
         pending = state["pending_action"] or {}
         action = Action(name=pending.get("name", ""), kwargs=pending.get("kwargs") or {})
         step_idx = state.get("step_idx", 0) + 1
+        call_id = state.get("pending_tool_call_id") or f"call_{step_idx}"
 
         started = time.time()
         try:
@@ -221,7 +231,6 @@ def build_episode_graph(
             latency_ms=latency_ms,
         )
 
-        call_id = state.get("pending_tool_call_id") or f"call_{step_idx}"
         return {
             "steps": [record],
             "step_idx": step_idx,
@@ -232,27 +241,9 @@ def build_episode_graph(
             "truncated": bool(resp.truncated),
             "pending_action": None,
             "messages": [
-                {
-                    "role": "assistant",
-                    # Some providers reject a null content alongside tool calls.
-                    "content": state.get("pending_thought", "") or "",
-                    "tool_calls": [
-                        {
-                            "id": call_id,
-                            "type": "function",
-                            "function": {
-                                "name": action.name,
-                                "arguments": json.dumps(action.kwargs, default=str),
-                            },
-                        }
-                    ],
-                },
-                {
-                    "role": "tool",
-                    "tool_call_id": call_id,
-                    "name": action.name,
-                    "content": str(tool_content),
-                },
+                ToolMessage(
+                    content=str(tool_content), tool_call_id=call_id, name=action.name
+                )
             ],
         }
 
@@ -368,6 +359,14 @@ def _admissible(observation: Any) -> list[str]:
     return [str(c) for c in commands] if isinstance(commands, Sequence) else []
 
 
+def _token_count(message: AIMessage) -> int:
+    """Total tokens for a reply, when the provider reported them."""
+    usage = getattr(message, "usage_metadata", None)
+    if isinstance(usage, dict):
+        return int(usage.get("total_tokens") or 0)
+    return 0
+
+
 def run_episode(
     graph: Any,
     env: Any,
@@ -422,3 +421,6 @@ def run_episode(
             generation=generation,
         )
     return trajectory
+
+
+__all__ = ["MAX_NUDGES", "build_episode_graph", "run_episode"]

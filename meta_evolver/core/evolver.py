@@ -21,13 +21,15 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
+from langchain_core.language_models.chat_models import BaseChatModel
+
 from meta_evolver.adaptive.controller import AdaptiveControllerConfig
 from meta_evolver.core.registry import get_benchmark
 from meta_evolver.core.types import GenerationReport, Trajectory
 from meta_evolver.graphs.episode import build_episode_graph, run_episode
 from meta_evolver.graphs.evolution import EvolutionConfig, build_evolution_graph
 from meta_evolver.harness.curriculum import Curriculum
-from meta_evolver.llm.client import BaseLLMClient, LiteLLMClient
+from meta_evolver.llm.client import DEFAULT_MODEL, build_chat_model, model_name
 from meta_evolver.llm.embeddings import Embedder
 from meta_evolver.memory.bank import ReasoningMemoryBank
 from meta_evolver.telemetry.engine import TelemetryEngine
@@ -39,10 +41,12 @@ class MetaEvolver:
     def __init__(
         self,
         benchmark: str | Any = "devops",
-        model: str = "gemini/gemini-3-flash",
-        client: BaseLLMClient | None = None,
+        model: str = DEFAULT_MODEL,
+        chat_model: BaseChatModel | None = None,
         bank: ReasoningMemoryBank | None = None,
         memory_path: str | Path | None = None,
+        embed_model: str | None = None,
+        embed_dimensions: int | None = None,
         config: EvolutionConfig | None = None,
         controller_config: AdaptiveControllerConfig | None = None,
         curriculum: Curriculum | None = None,
@@ -51,15 +55,26 @@ class MetaEvolver:
         use_memory: bool = True,
     ) -> None:
         self.benchmark = get_benchmark(benchmark) if isinstance(benchmark, str) else benchmark
-        self.client = client or LiteLLMClient(model=model)
+        self.model = chat_model or build_chat_model(model)
+        self.model_name = model_name(self.model)
         self.config = config or EvolutionConfig()
         self.curriculum = curriculum if curriculum is not None else Curriculum(
             enabled=self.config.curriculum
         )
 
-        self.embedder = Embedder(client=self.client)
+        # Embeddings are their own model, not the chat model. A scripted or
+        # local chat model must not disable retrieval, and a chat-provider
+        # switch must not silently re-embed an existing bank into a different
+        # vector space.
+        self.embedder = Embedder(model=embed_model, dimensions=embed_dimensions)
         if bank is not None:
             self.bank = bank
+            # A caller-supplied bank adopts this embedder. Otherwise
+            # `MetaEvolver(bank=..., embed_model=...)` would construct the
+            # requested embedder, hand it to nothing, and quietly keep the
+            # bank's default -- the configuration would appear to apply while
+            # every vector came from a different model.
+            self.bank.embedder = self.embedder
         elif memory_path is not None:
             self.bank = ReasoningMemoryBank.load(memory_path, embedder=self.embedder)
         else:
@@ -74,7 +89,7 @@ class MetaEvolver:
         self.reports: list[GenerationReport] = []
 
         self.episode_graph = build_episode_graph(
-            client=self.client,
+            model=self.model,
             bank=self.bank if use_memory else None,
             retrieval_k=self.config.retrieval_k,
             retrieval_mode=self.config.retrieval_mode,
@@ -106,7 +121,7 @@ class MetaEvolver:
         graph = build_evolution_graph(
             benchmark=self.benchmark,
             episode_graph=self.episode_graph,
-            client=self.client,
+            model=self.model,
             bank=self.bank,
             config=self.config,
             curriculum=self.curriculum,
@@ -141,7 +156,7 @@ class MetaEvolver:
         self.telemetry.save_summary(
             {
                 "benchmark": self.benchmark.name,
-                "model": self.client.model,
+                "model": self.model_name,
                 "memory": self.bank.stats(),
                 "prompt_version": self.prompt_version,
                 "curriculum": self.curriculum.describe(self.curriculum_level),
@@ -170,7 +185,7 @@ class MetaEvolver:
 
         graph = self.episode_graph
         if not use_memory:
-            graph = build_episode_graph(client=self.client, bank=None)
+            graph = build_episode_graph(model=self.model, bank=None)
 
         trajectories: list[Trajectory] = []
         for task_id in ids:

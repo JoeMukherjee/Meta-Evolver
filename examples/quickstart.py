@@ -20,7 +20,7 @@ from meta_evolver import EvolutionConfig, MetaEvolver
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--benchmark", default="devops")
-    parser.add_argument("--model", default="gemini/gemini-3-flash")
+    parser.add_argument("--model", default="google_genai:gemini-3-flash")
     parser.add_argument("--generations", type=int, default=4)
     parser.add_argument("--memory", default="memories.jsonl")
     args = parser.parse_args()
@@ -32,7 +32,7 @@ def main() -> int:
         config=EvolutionConfig(generations=args.generations, max_steps=15),
     )
 
-    print(f"Evolving on {evolver.benchmark.name} with {evolver.client.model}\n")
+    print(f"Evolving on {evolver.benchmark.name} with {evolver.model_name}\n")
 
     # Measure before learning anything, so the end-of-run number has a baseline
     # to be compared against. A curve that starts at generation 1 is not a curve.

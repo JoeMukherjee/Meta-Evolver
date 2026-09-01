@@ -27,8 +27,11 @@ import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import HumanMessage, SystemMessage
+
 from meta_evolver.core.types import Trajectory
-from meta_evolver.llm.client import BaseLLMClient, LLMError
+from meta_evolver.llm.client import LLMError, invoke_text
 from meta_evolver.prompts.templates import ensure_placeholders
 
 OPTIMIZER_SYSTEM = """\
@@ -81,12 +84,12 @@ class PromptOptimizer:
 
     def __init__(
         self,
-        client: BaseLLMClient,
+        model: BaseChatModel,
         n_candidates: int = 2,
         max_failures_in_prompt: int = 4,
         max_steps_per_trace: int = 10,
     ) -> None:
-        self.client = client
+        self.model = model
         self.n_candidates = int(n_candidates)
         self.max_failures_in_prompt = int(max_failures_in_prompt)
         self.max_steps_per_trace = int(max_steps_per_trace)
@@ -142,17 +145,15 @@ class PromptOptimizer:
             )
             body = OPTIMIZER_USER.format(**common, diversity_hint=hint)
             try:
-                resp = self.client.complete(
-                    messages=[
-                        {"role": "system", "content": OPTIMIZER_SYSTEM},
-                        {"role": "user", "content": body},
-                    ]
+                content = invoke_text(
+                    self.model,
+                    [SystemMessage(content=OPTIMIZER_SYSTEM), HumanMessage(content=body)],
                 )
             except LLMError as exc:
                 self.last_error = str(exc)
                 break
 
-            text = _clean(resp.content)
+            text = _clean(content)
             if len(text) < 80:
                 continue
             candidates.append(

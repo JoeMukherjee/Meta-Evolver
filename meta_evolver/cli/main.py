@@ -25,6 +25,7 @@ from meta_evolver.core.evolver import MetaEvolver
 from meta_evolver.core.registry import get_benchmark, list_benchmarks
 from meta_evolver.core.types import GenerationReport
 from meta_evolver.graphs.evolution import EvolutionConfig
+from meta_evolver.llm.client import DEFAULT_EMBED_MODEL, DEFAULT_MODEL
 
 app = typer.Typer(
     help="Meta-Evolver: a LangGraph engine for agents that improve on any benchmark.",
@@ -32,8 +33,6 @@ app = typer.Typer(
     add_completion=False,
 )
 console = Console()
-
-DEFAULT_MODEL = "gemini/gemini-3-flash"
 
 
 @app.command()
@@ -64,7 +63,9 @@ def benchmarks() -> None:
 def run(
     benchmark: str = typer.Option("devops", help="Registered benchmark name."),
     task: str | None = typer.Option(None, help="Task id. Defaults to the first train task."),
-    model: str = typer.Option(DEFAULT_MODEL, help="Any litellm model id."),
+    model: str = typer.Option(DEFAULT_MODEL, help="Any LangChain model id, e.g. openai:gpt-4.1."),
+    embed_model: str = typer.Option(DEFAULT_EMBED_MODEL, help="Embedding model."),
+    embed_dimensions: int = typer.Option(768, help="Embedding width (128-3072)."),
     memory: Path | None = typer.Option(None, help="Memory bank JSONL to retrieve from."),
     max_steps: int = typer.Option(15),
     curriculum_level: float = typer.Option(0.0, help="0 = clean env, 1 = fully adversarial."),
@@ -77,6 +78,8 @@ def run(
     evolver = MetaEvolver(
         benchmark=bench,
         model=model,
+        embed_model=embed_model,
+        embed_dimensions=embed_dimensions,
         memory_path=memory,
         config=EvolutionConfig(max_steps=max_steps),
         use_memory=not no_memory,
@@ -100,7 +103,11 @@ def run(
 @app.command()
 def evolve(
     benchmark: str = typer.Option("devops", help="Registered benchmark name."),
-    model: str = typer.Option(DEFAULT_MODEL, help="Any litellm model id."),
+    model: str = typer.Option(DEFAULT_MODEL, help="Any LangChain model id, e.g. openai:gpt-4.1."),
+    embed_model: str = typer.Option(DEFAULT_EMBED_MODEL, help="Embedding model."),
+    embed_dimensions: int = typer.Option(
+        768, help="Embedding width (128-3072). Lower is smaller and faster."
+    ),
     generations: int = typer.Option(5),
     max_steps: int = typer.Option(15),
     memory: Path | None = typer.Option(None, help="Memory bank JSONL to load and update."),
@@ -127,6 +134,8 @@ def evolve(
     evolver = MetaEvolver(
         benchmark=benchmark,
         model=model,
+        embed_model=embed_model,
+        embed_dimensions=embed_dimensions,
         memory_path=memory,
         run_dir=run_dir,
         config=config,
@@ -134,8 +143,12 @@ def evolve(
     )
 
     console.print(
-        f"[bold]{evolver.benchmark.name}[/bold] via [cyan]{evolver.client.model}[/cyan] "
+        f"[bold]{evolver.benchmark.name}[/bold] via [cyan]{evolver.model_name}[/cyan] "
         f"-- {generations} generations, {len(evolver.benchmark.task_ids('train'))} train tasks"
+    )
+    console.print(
+        f"embeddings: [cyan]{embed_model}[/cyan] at {embed_dimensions} dims"
+        f"{'' if evolver.embedder.remote_available else ' [yellow](unavailable; using local encoder)[/yellow]'}"
     )
     if no_validation:
         console.print("[yellow]validation disabled: prompt changes are unmeasured[/yellow]")
@@ -166,6 +179,8 @@ def evolve(
 def ablate(
     benchmark: str = typer.Option("devops"),
     model: str = typer.Option(DEFAULT_MODEL),
+    embed_model: str = typer.Option(DEFAULT_EMBED_MODEL, help="Embedding model."),
+    embed_dimensions: int = typer.Option(768, help="Embedding width (128-3072)."),
     memory: Path = typer.Option(..., help="Memory bank JSONL to evaluate."),
     split: str = typer.Option("eval"),
     max_steps: int = typer.Option(15),
@@ -179,6 +194,8 @@ def ablate(
     evolver = MetaEvolver(
         benchmark=benchmark,
         model=model,
+        embed_model=embed_model,
+        embed_dimensions=embed_dimensions,
         memory_path=memory,
         config=EvolutionConfig(max_steps=max_steps),
         telemetry=False,
