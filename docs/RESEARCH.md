@@ -17,6 +17,7 @@ The survey's taxonomy of scaffolding improvement maps onto the codebase directly
 | Survey category | Meta-Evolver |
 |---|---|
 | Prompt optimization (`p → p'`) | [`prompts/optimizer.py`](../meta_evolver/prompts/optimizer.py) — OPRO with held-out selection |
+| Evaluation: "report trajectories, transfer, resource cost, regression rates" | [`core/types.py`](../meta_evolver/core/types.py) — `GenerationReport` carries all four, including per-generation token spend |
 | Memory evolution (`m → m'`) | [`memory/bank.py`](../meta_evolver/memory/bank.py) — vector retrieval, MMR, credit-driven CRUD |
 | Tool governance (`T → T'`) | [`tools/routing.py`](../meta_evolver/tools/routing.py) — dynamic tool routing |
 | Full scaffolding update (`Σ → Σ'`) | *not implemented* — see [Deliberate omissions](#deliberate-omissions) |
@@ -44,7 +45,13 @@ Adopted in [`memory/induction.py`](../meta_evolver/memory/induction.py):
 - Both polarities. `polarity="failure"` items are anti-patterns and render differently in the prompt, so the agent reads them as "do not" rather than as a procedure.
 - Batched induction over an episode *set*. Reflecting on one trajectory produces lessons that restate that task; reflecting on several forces the model to find what they share, which is the part that transfers.
 
-The paper also introduces **MaTTS** (memory-aware test-time scaling): more rollouts per task give richer contrastive signal for synthesising memory, and better memory guides more effective scaling. Meta-Evolver's fan-out gives the mechanism for this — `Send` already parallelises rollouts — but the current loop runs one rollout per task per generation. Multi-rollout contrastive induction is the obvious next step and is not implemented.
+The paper also introduces **MaTTS** (memory-aware test-time scaling): more rollouts per task give richer contrastive signal for synthesising memory, and better memory guides more effective scaling. This is implemented in both halves, which matters — the scaling half alone just costs K times more.
+
+*Scaling:* `rollouts_per_task` fans out K independent `Send` branches per task, each seeded differently so attempts can actually diverge.
+
+*Synthesis:* `_contrastive_pairs` finds tasks where attempts disagreed and surfaces those traces first, labelled as a contrast. A success and a failure on the same task localise the decision that mattered in a way no number of unrelated episodes can.
+
+The accounting follows: with K rollouts a task passes if any attempt passed (pass@K), counted once per task rather than per episode — otherwise a task attempted three times would outvote one attempted once and the headline number would drift with the rollout budget instead of the agent. The report records which K produced it.
 
 ### What this adds beyond ReasoningBank
 
@@ -111,6 +118,31 @@ This is closest in spirit to EnvHarness-style environment mutation: the `Rules` 
 
 ---
 
+## Provenance as a graph
+
+A gap the survey names but does not solve: self-improvement rewrites shared
+scaffold, and attributing a change afterwards is a path problem. Which episodes
+produced the memory that carried a task? Did the prompt adopted in generation 3
+help in 4, or did a memory pruned at the same time explain it?
+
+[`graph_view/`](../meta_evolver/graph_view/) records the run as a causal graph
+in Neo4j — episodes, memories, prompts, curriculum levels, and edges that mean
+*produced*, *used*, *pruned*, *proposed from*. The two that matter most are
+`INDUCED` and `RETRIEVED`: together they make the memory bank's history
+legible, since following both directions from a memory gives where it came from
+and whether it ever helped.
+
+This is closest in spirit to the experience-graph line of work
+([EXG](https://arxiv.org/abs/2605.17721),
+[HyperSkill](https://arxiv.org/abs/2608.16114)), with one difference worth
+stating: those use a graph as the memory *structure* — retrieval traverses it.
+Here the graph is an *observability* layer over a flat bank. Retrieval never
+touches it, and a Neo4j that is down costs the picture and nothing else. Using
+graph structure for retrieval remains unimplemented, and the recorded edges are
+roughly the data such a change would need.
+
+---
+
 ## Deliberate omissions
 
 Things the literature supports that are **not** here, and why.
@@ -119,9 +151,11 @@ Things the literature supports that are **not** here, and why.
 
 **Full scaffolding update / self-modifying code.** The survey's deepest intervention tier: the agent rewrites its own control logic. It is also where its safety discussion is most emphatic — treat the agent as untrusted code, enforce layered gating. Not something to add without a sandbox story.
 
-**Graph-structured memory.** EXG and HyperSkill link memories into experience graphs and hypergraphs. The flat bank with MMR here is a deliberate first cut: the graph variants' benefit shows up at bank sizes well past what a five-task benchmark produces, and an unevaluated graph is harder to debug than a flat list. `MemoryItem` carries `scenario` and `source_task_ids`, which is the edge data a graph layer would need.
+**Graph-structured *retrieval*.** EXG and HyperSkill traverse a memory graph to retrieve. The flat bank with MMR here is a deliberate first cut: the benefit shows up at bank sizes well past what a five-task benchmark produces, and an unevaluated graph is harder to debug than a flat list. The causal graph described above already records the edges such a change would traverse — it is just not in the retrieval path.
 
-**MaTTS.** Discussed above — the fan-out exists, the contrastive induction does not.
+**Parametric distillation of what the scaffold learns.** The survey's "slow
+loop" -- consolidating stable scaffold behaviour into weights once it stops
+changing. Everything here stays reversible by design; this would not be.
 
 ### One risk worth naming
 
@@ -132,6 +166,9 @@ Meta-Evolver's partial mitigations are incidental rather than designed: memories
 ---
 
 ## Reading list
+
+A copy of the survey is kept at
+[`papers/2607.13104-self-improving-agents-survey.pdf`](papers/2607.13104-self-improving-agents-survey.pdf).
 
 | Paper | Relevance |
 |---|---|
@@ -147,4 +184,5 @@ Meta-Evolver's partial mitigations are incidental rather than designed: memories
 | [Benign Alone, Harmful Together](https://arxiv.org/abs/2608.01759) | Safety of composed experience |
 | [LangGraph docs](https://docs.langchain.com/oss/python/langgraph/graph-api) | `StateGraph`, reducers, `Send`, checkpointing |
 | [LangChain models](https://docs.langchain.com/oss/python/langchain/models) | `init_chat_model`, `bind_tools`, message types |
+| [LangGraph persistence](https://docs.langchain.com/oss/python/langgraph/persistence) | Checkpointers, threads, resumable runs |
 | [Gemini embeddings](https://ai.google.dev/gemini-api/docs/embeddings) | `output_dimensionality`, MRL truncation, `-2` renormalization |

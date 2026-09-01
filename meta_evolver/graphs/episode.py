@@ -29,9 +29,22 @@ through state.
 Messages are LangChain ``AnyMessage`` objects under the ``add_messages``
 reducer, so tool calls arrive already normalized on ``AIMessage.tool_calls``
 and nothing here re-implements a provider's wire format.
+
+Nodes are **async**. An episode is almost entirely waiting on a model, so a
+synchronous node holds a thread for the duration of a call it is not using.
+With async nodes, a generation's rollouts -- fanned out by the evolution graph
+-- overlap on one event loop, and wall-clock drops to roughly the slowest
+episode rather than the sum of all of them. :func:`run_episode` keeps a
+synchronous entry point for callers that have no loop of their own.
+
+One caveat worth naming: ``env.step`` is called directly rather than through a
+thread. The benchmarks here are in-process simulators where that is free. An
+environment that does real I/O should be stepped with ``asyncio.to_thread`` so
+it does not stall the loop for every other rollout.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from collections.abc import Sequence
@@ -39,14 +52,16 @@ from typing import Any, Literal
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 
 from meta_evolver.adaptive.controller import (
     AdaptiveControllerConfig,
     AdaptiveExplorationController,
 )
+from meta_evolver.core.aio import selector_loop_factory
 from meta_evolver.core.types import Action, StepRecord, Trajectory
-from meta_evolver.graphs.state import EpisodeState
+from meta_evolver.graphs.state import EpisodeRuntime, EpisodeState
 from meta_evolver.llm.client import message_text
 from meta_evolver.memory.bank import ReasoningMemoryBank
 from meta_evolver.prompts.templates import render_system_prompt
@@ -65,6 +80,7 @@ def build_episode_graph(
     controller_config: AdaptiveControllerConfig | None = None,
     observation_chars: int = 4000,
     tool_router: ToolRouter | None = None,
+    checkpointer: Any = None,
 ):
     """Compile the episode graph.
 
@@ -75,14 +91,23 @@ def build_episode_graph(
     ``tool_router`` is optional. Supply one when the environment exposes a
     large registry and most of it is irrelevant to any single task; without it
     the agent sees every tool the environment offers.
+
+    ``checkpointer`` persists state after every superstep, which is what makes
+    an episode resumable and inspectable mid-flight. The environment and the
+    adaptive controller travel in ``config`` rather than state (see
+    :class:`~meta_evolver.graphs.state.EpisodeRuntime`) precisely so that they
+    do not have to serialize: a resumed episode recovers the transcript and
+    the step record and is handed a fresh environment, which is the right
+    granularity here -- episodes are cheap to replay, generations are not.
     """
     cfg = controller_config or AdaptiveControllerConfig()
 
     # -- nodes -------------------------------------------------------------
 
-    def prepare(state: EpisodeState) -> dict[str, Any]:
+    async def prepare(state: EpisodeState, config: RunnableConfig) -> dict[str, Any]:
         """Reset the environment, retrieve memories, seed the conversation."""
-        env = state["env"]
+        runtime = _runtime(config)
+        env = runtime.env
         task_id = state.get("task_id", "")
         reset = env.reset(options={"task_id": task_id})
         obs = reset.observation
@@ -100,10 +125,9 @@ def build_episode_graph(
 
         controller = AdaptiveExplorationController(memories=retrieved, config=cfg)
         controller.record_candidates(_admissible(obs))
+        runtime.controller = controller
 
         return {
-            "env": env,
-            "controller": controller,
             "instruction": instruction,
             "observation": obs.text[:observation_chars],
             "admissible": _admissible(obs),
@@ -128,7 +152,7 @@ def build_episode_graph(
             "pending_thought": "",
         }
 
-    def think(state: EpisodeState) -> dict[str, Any]:
+    async def think(state: EpisodeState, config: RunnableConfig) -> dict[str, Any]:
         """Ask the model for the next action.
 
         The system prompt is rebuilt every turn, because the two injected
@@ -137,7 +161,8 @@ def build_episode_graph(
         as of this step. A prompt built once at episode start would keep
         re-asserting a prior the controller has already retired.
         """
-        env, controller = state["env"], state["controller"]
+        runtime = _runtime(config)
+        env, controller = runtime.env, runtime.controller
         system = render_system_prompt(
             state.get("prompt_template", ""),
             memory_section=controller.memory_block(),
@@ -155,7 +180,7 @@ def build_episode_graph(
             tools = tool_router.select(tools, query)
 
         try:
-            reply = model.bind_tools(tools).invoke(messages)
+            reply = await model.bind_tools(tools).ainvoke(messages)
         except Exception as exc:
             # An infrastructure failure is not a task failure. Recording it as
             # `error` keeps it out of the learning signal downstream.
@@ -179,7 +204,7 @@ def build_episode_graph(
             "nudges": 0,
         }
 
-    def nudge(state: EpisodeState) -> dict[str, Any]:
+    async def nudge(state: EpisodeState) -> dict[str, Any]:
         """The model answered in prose. Record it and ask again."""
         thought = state.get("pending_thought", "")
         return {
@@ -195,9 +220,9 @@ def build_episode_graph(
             ],
         }
 
-    def act(state: EpisodeState) -> dict[str, Any]:
+    async def act(state: EpisodeState, config: RunnableConfig) -> dict[str, Any]:
         """Execute the chosen action against the environment."""
-        env = state["env"]
+        env = _runtime(config).env
         pending = state["pending_action"] or {}
         action = Action(name=pending.get("name", ""), kwargs=pending.get("kwargs") or {})
         step_idx = state.get("step_idx", 0) + 1
@@ -247,16 +272,16 @@ def build_episode_graph(
             ],
         }
 
-    def adapt(state: EpisodeState) -> dict[str, Any]:
+    async def adapt(state: EpisodeState, config: RunnableConfig) -> dict[str, Any]:
         """Update exploration state; evict the memory prior if it has stalled.
 
         Mutates the controller in place -- it is the same object for the whole
         episode -- and returns nothing, because its influence reaches ``think``
         through the prompt sections rather than through state.
         """
-        controller = state["controller"]
+        controller = _runtime(config).controller
         steps = state.get("steps") or []
-        if steps:
+        if steps and controller is not None:
             last = steps[-1]
             controller.record_step(
                 action_text=last.action.render(),
@@ -266,9 +291,10 @@ def build_episode_graph(
             )
         return {}
 
-    def finalize(state: EpisodeState) -> dict[str, Any]:
+    async def finalize(state: EpisodeState, config: RunnableConfig) -> dict[str, Any]:
         """Score the episode and assemble the trajectory."""
-        env, controller = state["env"], state.get("controller")
+        runtime = _runtime(config)
+        env, controller = runtime.env, runtime.controller
         steps = state.get("steps") or []
         error = state.get("error", "")
 
@@ -299,6 +325,8 @@ def build_episode_graph(
             prompt_version=state.get("prompt_version", "base"),
             generation=int(state.get("generation", 0)),
             duration_ms=sum(s.latency_ms for s in steps),
+            tokens=int(state.get("tokens", 0)),
+            rollout_index=int(state.get("rollout_index", 0)),
         )
         return {"trajectory": trajectory}
 
@@ -344,7 +372,18 @@ def build_episode_graph(
     graph.add_conditional_edges("adapt", route_after_adapt, ["think", "finalize"])
     graph.add_edge("finalize", END)
 
-    return graph.compile()
+    return graph.compile(checkpointer=checkpointer)
+
+
+def _runtime(config: RunnableConfig) -> EpisodeRuntime:
+    """The live objects for this episode, from LangGraph's config channel."""
+    runtime = (config or {}).get("configurable", {}).get("runtime")
+    if runtime is None:
+        raise RuntimeError(
+            "no EpisodeRuntime in config; call arun_episode() rather than "
+            "invoking the episode graph directly"
+        )
+    return runtime
 
 
 def _admissible(observation: Any) -> list[str]:
@@ -367,7 +406,7 @@ def _token_count(message: AIMessage) -> int:
     return 0
 
 
-def run_episode(
+async def arun_episode(
     graph: Any,
     env: Any,
     task_id: str,
@@ -377,6 +416,8 @@ def run_episode(
     max_steps: int = 15,
     generation: int = 0,
     prompt_version: str = "base",
+    rollout_index: int = 0,
+    thread_id: str | None = None,
     recursion_limit: int | None = None,
 ) -> Trajectory:
     """Run one episode to completion and return its trajectory.
@@ -385,22 +426,35 @@ def run_episode(
     costs roughly three supersteps (think, act, adapt), plus nudges, so the
     default is derived from ``max_steps`` rather than left at LangGraph's 25 --
     which a 15-step episode would otherwise trip long before finishing.
+
+    ``thread_id`` addresses the checkpoint stream. It must be unique per
+    episode -- including per rollout when a task is attempted several times --
+    or concurrent rollouts of one task would write over each other's state.
     """
     limit = recursion_limit or (max_steps * 4 + 12)
     initial: EpisodeState = {
-        "env": env,
         "task_id": task_id,
         "benchmark": benchmark,
         "instruction": instruction,
         "prompt_template": prompt_template,
         "prompt_version": prompt_version,
         "generation": generation,
+        "rollout_index": rollout_index,
         "max_steps": max_steps,
         "messages": [],
         "steps": [],
     }
+    configurable: dict[str, Any] = {"runtime": EpisodeRuntime(env=env)}
+    if thread_id is not None:
+        configurable["thread_id"] = thread_id
+    else:
+        # A checkpointer requires a thread id. Deriving one keeps the graph
+        # usable without a caller having to care whether it is checkpointed.
+        configurable["thread_id"] = f"{benchmark}:{task_id}:{generation}:{rollout_index}"
+    config: dict[str, Any] = {"recursion_limit": limit, "configurable": configurable}
+
     try:
-        final = graph.invoke(initial, config={"recursion_limit": limit})
+        final = await graph.ainvoke(initial, config=config)
     except Exception as exc:
         return Trajectory(
             task_id=task_id,
@@ -409,6 +463,7 @@ def run_episode(
             error=f"graph: {type(exc).__name__}: {exc}",
             generation=generation,
             prompt_version=prompt_version,
+            rollout_index=rollout_index,
         )
 
     trajectory = final.get("trajectory")
@@ -419,8 +474,21 @@ def run_episode(
             instruction=instruction,
             error="episode graph produced no trajectory",
             generation=generation,
+            rollout_index=rollout_index,
         )
     return trajectory
 
 
-__all__ = ["MAX_NUDGES", "build_episode_graph", "run_episode"]
+def run_episode(*args: Any, **kwargs: Any) -> Trajectory:
+    """Synchronous :func:`arun_episode`, for callers with no event loop.
+
+    A one-shot loop, since a single episode owns nothing that has to outlive
+    the call. An object that holds a connection pool across calls -- like
+    :class:`~meta_evolver.core.evolver.MetaEvolver` -- needs a persistent one
+    instead; see :mod:`meta_evolver.core.aio`.
+    """
+    with asyncio.Runner(loop_factory=selector_loop_factory()) as runner:
+        return runner.run(arun_episode(*args, **kwargs))
+
+
+__all__ = ["MAX_NUDGES", "arun_episode", "build_episode_graph", "run_episode"]

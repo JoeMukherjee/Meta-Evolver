@@ -135,6 +135,15 @@ class Trajectory(BaseModel):
     separate: counting a rate-limit as a task failure poisons every downstream
     signal -- the memory bank, the prompt optimizer, and the curriculum."""
     duration_ms: float = 0.0
+    tokens: int = 0
+    """Total tokens this episode cost, when the provider reported them.
+
+    Aggregated per generation so a run can answer the question a curriculum
+    decision actually turns on -- what a point of improvement cost -- rather
+    than only whether the number went up."""
+    rollout_index: int = 0
+    """Which of the K rollouts for this task this was. Non-zero only under
+    memory-aware test-time scaling; see :class:`EvolutionConfig`."""
     retrieved_memory_ids: list[str] = Field(default_factory=list)
     """Which memories were in the prompt. The credit-assignment pass reads
     this to decide which memories actually earn their retrieval slot."""
@@ -277,9 +286,18 @@ class GenerationReport(BaseModel):
     prompt_version: str = "base"
     curriculum_level: float = 0.0
     validation_pass_rate: float | None = None
+    tokens: int = 0
+    """Every token this generation spent -- rollouts, induction, prompt
+    proposals and validation. Counted through LangChain's usage callback, so
+    it covers model calls this module never sees directly."""
+    rollouts_per_task: int = 1
     duration_s: float = 0.0
     timestamp: float = Field(default_factory=time.time)
     notes: list[str] = Field(default_factory=list)
+
+    @property
+    def tokens_per_task(self) -> float:
+        return self.tokens / self.n_tasks if self.n_tasks else 0.0
 
     def render(self) -> str:
         return (
@@ -290,5 +308,6 @@ class GenerationReport(BaseModel):
             f"{' *' if self.prompt_changed else '  '}"
             f"| curriculum {self.curriculum_level:.2f}"
             f"{f' | +{self.recoveries}/-{self.regressions}' if (self.recoveries or self.regressions) else ''}"
+            f"{f' | {self.tokens / 1000:.0f}k tok' if self.tokens else ''}"
             f"{f' | errors {self.n_errors}' if self.n_errors else ''}"
         )
