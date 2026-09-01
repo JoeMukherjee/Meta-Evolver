@@ -146,3 +146,5 @@ Meta-Evolver's partial mitigations are incidental rather than designed: memories
 | [SEED](https://arxiv.org/abs/2607.14777) | On-policy distillation for agentic RL |
 | [Benign Alone, Harmful Together](https://arxiv.org/abs/2608.01759) | Safety of composed experience |
 | [LangGraph docs](https://docs.langchain.com/oss/python/langgraph/graph-api) | `StateGraph`, reducers, `Send`, checkpointing |
+| [LangChain models](https://docs.langchain.com/oss/python/langchain/models) | `init_chat_model`, `bind_tools`, message types |
+| [Gemini embeddings](https://ai.google.dev/gemini-api/docs/embeddings) | `output_dimensionality`, MRL truncation, `-2` renormalization |

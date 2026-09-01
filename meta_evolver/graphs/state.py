@@ -20,6 +20,9 @@ from __future__ import annotations
 import operator
 from typing import Annotated, Any, TypedDict
 
+from langchain_core.messages import AnyMessage
+from langgraph.graph.message import add_messages
+
 from meta_evolver.core.types import (
     GenerationReport,
     MemoryItem,
@@ -57,7 +60,14 @@ class EpisodeState(TypedDict, total=False):
     controller: Any
 
     # -- accumulating ------------------------------------------------------
-    messages: Annotated[list[dict[str, Any]], operator.add]
+    messages: Annotated[list[AnyMessage], add_messages]
+    """LangChain messages under LangGraph's own reducer.
+
+    ``add_messages`` rather than ``operator.add`` because it de-duplicates by
+    message id and supports in-place updates -- which is what lets a node
+    revise or remove a message later (trimming history, redacting a tool
+    result) instead of only ever appending."""
+
     steps: Annotated[list[StepRecord], operator.add]
 
     # -- rolling scalars ---------------------------------------------------
@@ -67,6 +77,8 @@ class EpisodeState(TypedDict, total=False):
     pending_action: dict[str, Any] | None
     pending_thought: str
     pending_tool_call_id: str
+    """Echoed back on the ToolMessage. A tool result whose id does not match
+    the call that produced it is rejected by every provider."""
     nudges: int
     terminated: bool
     truncated: bool

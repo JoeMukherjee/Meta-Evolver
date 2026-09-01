@@ -1,15 +1,31 @@
 """Embeddings, with a deterministic local fallback.
 
-Retrieval must keep working without an embedding API -- offline, in CI, and
-when a provider is down -- so every embedder degrades to a hashed bag-of-words
+Backed by LangChain's ``Embeddings`` interface, so any provider integration
+works and the memory bank never sees a vendor SDK.
+
+**Model.** ``gemini-embedding-2`` at 768 of its 3072 dimensions. Both Gemini
+embedding models are Matryoshka-trained -- the most significant structure is
+packed into the leading dimensions, so a truncated vector keeps nearly all of
+its retrieval signal at a quarter of the storage and a quarter of the
+dot-product cost. Both costs are real here: a bank persists every vector to
+JSONL, and MMR retrieval is O(k*n) dot products per episode.
+
+The reason for ``-2`` specifically is normalization. It **renormalizes
+truncated output automatically**; ``gemini-embedding-001`` does not, so a
+768-dim vector from ``-001`` is no longer unit-norm and every consumer has to
+renormalize it or silently start comparing by magnitude as well as direction.
+This module normalizes on arrival anyway, so a bank stays coherent across a
+model switch -- but with ``-2`` that guard is a belt, not the braces.
+
+**Fallback.** Retrieval must keep working with no embedding API -- offline, in
+CI, when a provider is down -- so this degrades to a hashed bag-of-words
 encoder rather than failing.
 
-The fallback uses ``zlib.crc32``, not the built-in ``hash()``. Python
+That fallback uses ``zlib.crc32``, not the built-in ``hash()``. Python
 randomizes string hashing per process unless ``PYTHONHASHSEED`` is pinned, so
 a bank persisted by one process and queried by the next would compare vectors
-drawn from two different random projections: retrieval would silently return
-near-noise, and the failure looks like "memory just doesn't help much" rather
-than like a bug. CRC32 is stable across processes, machines and releases.
+drawn from two different random projections: retrieval would return near-noise
+while looking like it worked. CRC32 is stable across processes and platforms.
 """
 from __future__ import annotations
 
@@ -17,8 +33,7 @@ import math
 import re
 import zlib
 from collections.abc import Sequence
-
-from meta_evolver.llm.client import BaseLLMClient
+from typing import Any
 
 FALLBACK_DIM = 256
 
@@ -36,6 +51,12 @@ def _tokens(text: str) -> list[str]:
     return [t for t in _TOKEN_RE.findall(text.lower()) if t not in _STOPWORDS and len(t) > 1]
 
 
+def l2_normalize(vec: Sequence[float]) -> list[float]:
+    """Scale to unit length. A zero vector is returned unchanged."""
+    norm = math.sqrt(sum(v * v for v in vec))
+    return [v / norm for v in vec] if norm > 0 else list(vec)
+
+
 def hashed_embedding(text: str, dim: int = FALLBACK_DIM) -> list[float]:
     """Stable, L2-normalized hashed bag-of-words with sub-linear term weighting.
 
@@ -51,24 +72,72 @@ def hashed_embedding(text: str, dim: int = FALLBACK_DIM) -> list[float]:
         bucket = digest % dim
         sign = 1.0 if (digest >> 16) & 1 else -1.0
         vec[bucket] += sign * (1.0 + math.log(count))
-    norm = math.sqrt(sum(v * v for v in vec))
-    if norm > 0:
-        vec = [v / norm for v in vec]
-    return vec
+    return l2_normalize(vec)
+
+
+def build_embeddings(
+    model: str | None = None, dimensions: int | None = None, **kwargs: Any
+) -> Any:
+    """A LangChain ``Embeddings`` for ``model``, or ``None`` if unavailable.
+
+    Returns ``None`` rather than raising when the provider package is missing
+    or no credentials are configured. :class:`Embedder` then runs on the local
+    encoder, which is the difference between "retrieval is a bit worse" and
+    "the run does not start".
+    """
+    from meta_evolver.llm.client import (
+        DEFAULT_EMBED_DIMENSIONS,
+        DEFAULT_EMBED_MODEL,
+        load_dotenv_once,
+        split_model,
+    )
+
+    load_dotenv_once()
+    spec = model or DEFAULT_EMBED_MODEL
+    width = DEFAULT_EMBED_DIMENSIONS if dimensions is None else dimensions
+    provider, name = split_model(spec)
+
+    try:
+        if provider == "google_genai":
+            from langchain_google_genai import GoogleGenerativeAIEmbeddings
+
+            # `output_dimensionality` is a first-class parameter on this
+            # integration. Routing through a generic gateway instead risks it
+            # being dropped: the width silently reverts to 3072, storage
+            # quadruples, and nothing errors.
+            if width:
+                kwargs.setdefault("output_dimensionality", int(width))
+            return GoogleGenerativeAIEmbeddings(model=name, **kwargs)
+
+        from langchain.embeddings import init_embeddings
+
+        if width:
+            kwargs.setdefault("dimensions", int(width))
+        return init_embeddings(name, provider=provider or None, **kwargs)
+    except Exception:
+        return None
 
 
 class Embedder:
-    """Embeds text via an LLM client, falling back to the local encoder.
+    """Embeds text via a LangChain ``Embeddings``, falling back locally.
 
     Results are cached by text, because the memory bank re-embeds the same
     items on every retrieval round and the calls are neither free nor fast.
     """
 
-    def __init__(self, client: BaseLLMClient | None = None, dim: int = FALLBACK_DIM) -> None:
-        self.client = client
+    def __init__(
+        self,
+        embeddings: Any | None = None,
+        model: str | None = None,
+        dimensions: int | None = None,
+        dim: int = FALLBACK_DIM,
+    ) -> None:
+        if embeddings is None and model is not None:
+            embeddings = build_embeddings(model, dimensions=dimensions)
+        self.embeddings = embeddings
         self.dim = dim
         self._cache: dict[str, list[float]] = {}
-        self.remote_available = client is not None
+        self.remote_available = embeddings is not None
         self.n_remote = 0
         self.n_fallback = 0
 
@@ -76,11 +145,16 @@ class Embedder:
         texts = list(texts)
         missing = [t for t in texts if t not in self._cache]
 
-        if missing and self.remote_available and self.client is not None:
-            vectors = self.client.embed(missing)
+        if missing and self.remote_available and self.embeddings is not None:
+            try:
+                vectors = self.embeddings.embed_documents(missing)
+            except Exception:
+                vectors = None
             if vectors and len(vectors) == len(missing):
                 for text, vec in zip(missing, vectors, strict=True):
-                    self._cache[text] = vec
+                    # Normalized on arrival so the bank stays coherent even
+                    # across an embedding-model switch. See the module note.
+                    self._cache[text] = l2_normalize(vec)
                 self.n_remote += len(missing)
                 missing = []
             else:
@@ -103,9 +177,16 @@ def cosine(a: Sequence[float], b: Sequence[float]) -> float:
     """Cosine similarity, tolerant of dimension mismatch.
 
     Vectors can genuinely differ in width within one bank: items embedded
-    remotely before an outage sit alongside items embedded locally after it.
-    Comparing over the shared prefix keeps retrieval running; the alternative
-    is an exception in the middle of a long evolution run.
+    remotely before an outage sit alongside items embedded locally after it,
+    or a bank predates a change in the configured embedding width.
+
+    Comparing over the shared prefix keeps retrieval running rather than
+    raising mid-run -- and for a Matryoshka-trained model it is the *correct*
+    comparison, not merely a survivable one: the leading dimensions of a
+    3072-wide vector are exactly what the model would have returned at 768.
+    Renormalizing over the prefix, as this does, is what makes that hold.
+    Across genuinely different embedding spaces the number is meaningless but
+    bounded, which is the intended failure mode.
     """
     n = min(len(a), len(b))
     if n == 0:

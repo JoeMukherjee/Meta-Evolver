@@ -2,10 +2,10 @@
 
     python examples/offline_demo.py
 
-A scripted model stands in for the LLM, so every moving part -- the episode
-graph, memory induction, credit assignment, pruning, the curriculum -- runs
-deterministically in about a second. Useful for seeing the shape of a run
-before spending anything on one, and for checking an install.
+A scripted LangChain chat model stands in for the LLM, so every moving part --
+the episode graph, memory induction, credit assignment, pruning, the
+curriculum -- runs deterministically in about a second. Useful for seeing the
+shape of a run before spending anything on one, and for checking an install.
 """
 from __future__ import annotations
 
@@ -15,8 +15,17 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from meta_evolver import Curriculum, EvolutionConfig, MetaEvolver, ReasoningMemoryBank
-from meta_evolver.llm.client import LLMResponse, ScriptedLLMClient, ToolCall
+from langchain_core.messages import AIMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
+
+from meta_evolver import (
+    Curriculum,
+    EvolutionConfig,
+    MetaEvolver,
+    ReasoningMemoryBank,
+    ScriptedChatModel,
+    tool_call_message,
+)
 
 INDUCED = json.dumps(
     {
@@ -38,55 +47,58 @@ GOALS = {
     "cache": ("cache-worker", {"ttl_seconds": 600, "eviction_policy": "allkeys-lru"}),
     "429": ("sync-worker", {"poll_interval_ms": 2000}),
     "space left": ("log-shipper", {"retention_days": 14}),
+    "ingest": ("log-shipper", {"retention_days": 14}),
 }
 
 
-def scripted_agent(messages, tools):
+def scripted_agent(messages):
     """A competent agent: diagnose, patch, restart, verify, submit."""
     used = {
-        m["tool_calls"][0]["function"]["name"]
-        for m in messages
-        if m.get("role") == "assistant" and m.get("tool_calls")
+        call["name"] for m in messages for call in (getattr(m, "tool_calls", None) or [])
     }
-    text = " ".join(str(m.get("content", "")) for m in messages)
+    text = " ".join(str(getattr(m, "content", "")) for m in messages)
     service, patch = next(
         (goal for marker, goal in GOALS.items() if marker in text),
         ("db-proxy", {"max_connections": 50}),
     )
 
-    def call(name, **kwargs):
-        return LLMResponse(content="", tool_calls=[ToolCall(id="c", name=name, arguments=kwargs)])
-
     if "inspect_service_logs" not in used:
-        return call("inspect_service_logs", service_name=service)
+        return tool_call_message("inspect_service_logs", service_name=service)
     if "patch_service_config" not in used:
-        return call("patch_service_config", service_name=service, config_patch=patch)
+        return tool_call_message(
+            "patch_service_config", service_name=service, config_patch=patch
+        )
     if "restart_service" not in used:
-        return call("restart_service", service_name=service)
+        return tool_call_message("restart_service", service_name=service)
     if "run_healthcheck" not in used:
-        return call("run_healthcheck", endpoint="health")
-    return call("submit_resolution", root_cause="diagnosed", action_taken="patched and restarted")
+        return tool_call_message("run_healthcheck", endpoint="health")
+    return tool_call_message(
+        "submit_resolution", root_cause="diagnosed", action_taken="patched and restarted"
+    )
 
 
-class OfflineClient(ScriptedLLMClient):
+class OfflineModel(ScriptedChatModel):
     """Plays all three roles, dispatching on the system prompt."""
 
     def __init__(self):
-        super().__init__(responder=lambda m, t: LLMResponse())
+        super().__init__(responder=lambda m, t: AIMessage(content=""))
 
-    def complete(self, messages, tools=None, response_format=None, max_tokens=None, **kwargs):
-        system = str(messages[0].get("content", "")) if messages else ""
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        self.calls.append(list(messages))
+        system = str(getattr(messages[0], "content", "")) if messages else ""
         if "distil agent execution traces" in system:
-            return LLMResponse(content=INDUCED)
-        if "improve the system instructions" in system:
-            return LLMResponse(content="Be rigorous.\n\n{memory_section}\n{guidance_section}")
-        return scripted_agent(list(messages), tools)
+            reply = AIMessage(content=INDUCED)
+        elif "improve the system instructions" in system:
+            reply = AIMessage(content="Be rigorous.\n\n{memory_section}\n{guidance_section}")
+        else:
+            reply = scripted_agent(list(messages))
+        return ChatResult(generations=[ChatGeneration(message=reply)])
 
 
 def main() -> int:
     evolver = MetaEvolver(
         benchmark="devops",
-        client=OfflineClient(),
+        chat_model=OfflineModel(),
         bank=ReasoningMemoryBank(),
         config=EvolutionConfig(generations=4, max_steps=10, validate_prompt=False, patience=99),
         curriculum=Curriculum(enabled=True),
@@ -104,6 +116,11 @@ def main() -> int:
 
     held_out = evolver.evaluate(split="eval", curriculum_level=0.0)
     print(f"\nheld-out pass rate: {held_out['pass_rate'] * 100:.0f}%")
+    print(
+        "\nembeddings: "
+        + ("remote" if evolver.embedder.remote_available else "local fallback encoder")
+        + f" ({evolver.embedder.n_remote} remote, {evolver.embedder.n_fallback} local)"
+    )
     return 0
 
 

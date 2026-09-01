@@ -1,92 +1,92 @@
 """Shared fixtures.
 
 The point of this file is that the whole engine is testable without a network
-call. ``scripted_agent`` builds an LLM client that plays a fixed policy over
-the DevOps benchmark, so the episode graph, the evolution loop, the curriculum
-and the memory bank all run end to end in CI in under a second.
+call. The scripted chat models below are real LangChain ``BaseChatModel``
+instances, so the graphs exercise exactly the code path a live model takes --
+``bind_tools``, ``AIMessage.tool_calls``, ``ToolMessage`` round-tripping --
+rather than a parallel mock path that can drift from it.
 """
 from __future__ import annotations
 
-import json
 import sys
 from pathlib import Path
 
 import pytest
+from langchain_core.messages import AIMessage
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from meta_evolver.llm.client import LLMResponse, ScriptedLLMClient, ToolCall  # noqa: E402
+from meta_evolver.llm.client import ScriptedChatModel, tool_call_message  # noqa: E402
 
 
-def call(name: str, **kwargs) -> LLMResponse:
-    """One tool call, as an ``LLMResponse``."""
-    return LLMResponse(
-        content=f"calling {name}",
-        tool_calls=[ToolCall(id=f"c-{name}", name=name, arguments=kwargs)],
-    )
+def tools_used(messages) -> set[str]:
+    """Names of every tool call already made in a transcript."""
+    used: set[str] = set()
+    for message in messages:
+        for call in getattr(message, "tool_calls", None) or []:
+            used.add(call["name"])
+    return used
+
+
+def transcript_text(messages) -> str:
+    """All message content concatenated, for keyword matching in a responder."""
+    return " ".join(str(getattr(m, "content", "")) for m in messages)
 
 
 @pytest.fixture
-def scripted_client():
-    """Factory for a client that replays a fixed list of responses."""
+def scripted_model():
+    """Factory for a model that replays a fixed list of replies."""
 
-    def build(*responses: LLMResponse) -> ScriptedLLMClient:
-        return ScriptedLLMClient(script=list(responses))
+    def build(*replies: AIMessage) -> ScriptedChatModel:
+        return ScriptedChatModel(script=list(replies))
 
     return build
 
 
-@pytest.fixture
-def solving_client():
-    """A client that solves ``db_pool`` correctly, then idles.
+def solving_responder(messages, tools):
+    """A competent DevOps agent: diagnose, patch, restart, verify, submit.
 
-    Written as a responder rather than a script so it is robust to the graph
-    inserting an extra turn: a script that runs out mid-episode would fail the
-    test for a reason unrelated to what it is checking.
+    Written as a responder rather than a fixed script so it is robust to the
+    graph inserting an extra turn -- a script that ran out mid-episode would
+    fail tests for a reason unrelated to what they check.
     """
-
-    def responder(messages, tools):
-        used = {
-            json.loads(m["tool_calls"][0]["function"]["arguments"] or "{}").get("service_name", "")
-            + ":"
-            + m["tool_calls"][0]["function"]["name"]
-            for m in messages
-            if m.get("role") == "assistant" and m.get("tool_calls")
-        }
-        names = {u.split(":", 1)[1] for u in used}
-
-        if "inspect_service_logs" not in names:
-            return call("inspect_service_logs", service_name="payment-gateway")
-        if "inspect_service_config" not in names:
-            return call("inspect_service_config", service_name="db-proxy")
-        if "patch_service_config" not in names:
-            return call(
-                "patch_service_config",
-                service_name="db-proxy",
-                config_patch={"max_connections": 50},
-            )
-        if "restart_service" not in names:
-            return call("restart_service", service_name="db-proxy")
-        if "run_healthcheck" not in names:
-            return call("run_healthcheck", endpoint="payments/charge")
-        return call(
-            "submit_resolution",
-            root_cause="db-proxy connection pool limit too low",
-            action_taken="raised max_connections to 50 and restarted db-proxy",
+    used = tools_used(messages)
+    if "inspect_service_logs" not in used:
+        return tool_call_message("inspect_service_logs", service_name="payment-gateway")
+    if "inspect_service_config" not in used:
+        return tool_call_message("inspect_service_config", service_name="db-proxy")
+    if "patch_service_config" not in used:
+        return tool_call_message(
+            "patch_service_config",
+            service_name="db-proxy",
+            config_patch={"max_connections": 50},
         )
-
-    return ScriptedLLMClient(responder=responder)
+    if "restart_service" not in used:
+        return tool_call_message("restart_service", service_name="db-proxy")
+    if "run_healthcheck" not in used:
+        return tool_call_message("run_healthcheck", endpoint="payments/charge")
+    return tool_call_message(
+        "submit_resolution",
+        root_cause="db-proxy connection pool limit too low",
+        action_taken="raised max_connections to 50 and restarted db-proxy",
+    )
 
 
 @pytest.fixture
-def looping_client():
-    """A client that never makes progress -- it re-reads the same logs forever.
+def solving_model():
+    """A model that solves ``db_pool`` correctly."""
+    return ScriptedChatModel(responder=solving_responder)
+
+
+@pytest.fixture
+def looping_model():
+    """A model that never makes progress -- it re-reads the same logs forever.
 
     Used to prove stagnation eviction fires and that a hopeless episode still
     terminates cleanly at the step budget instead of hanging.
     """
-    return ScriptedLLMClient(
-        responder=lambda messages, tools: call(
+    return ScriptedChatModel(
+        responder=lambda messages, tools: tool_call_message(
             "inspect_service_logs", service_name="payment-gateway"
         )
     )

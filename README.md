@@ -5,7 +5,7 @@
 Most agent frameworks give you a loop that runs a task. This one gives you a loop that runs a task, learns from how it went, and runs it again better — and keeps doing that until the improvement stops.
 
 ```bash
-pip install -e .
+pip install -e ".[google]"     # or [openai], [anthropic], [all]
 export GEMINI_API_KEY=...
 
 meta-evolver benchmarks                       # what can I run against
@@ -152,11 +152,21 @@ Both are self-contained, deterministic, and run offline — no dataset download,
 
 ---
 
-## Provider handling
+## Models and embeddings
 
-Any [litellm](https://github.com/BerriAI/litellm) model id works: `--model openai/gpt-4.1`, `--model anthropic/claude-opus-4-7`, `--model gemini/gemini-3-flash` (default).
+Chat models are LangChain `BaseChatModel` instances built through `init_chat_model`, so any provider integration works: `--model openai:gpt-4.1`, `--model anthropic:claude-opus-4-7`, `--model google_genai:gemini-3-flash` (default). The older `provider/model` spelling resolves too, so existing configs keep working.
 
-One provider quirk is handled centrally rather than at each call site: **Google removed the manual sampling overrides from the Gemini API.** `temperature`, `top_p` and `top_k` are deprecated there — generation is steered by the thinking level instead. `LLMClient._prepare` strips them for any Gemini route (the `gemini/` prefix, `vertex_ai/gemini-*`, and bare `gemini-*` names) while leaving them intact for providers that still honour them. A config carrying `temperature: 0.4` stays correct on both.
+LangChain rather than a generic gateway because LangGraph is the orchestration layer here: state carries real `AnyMessage` objects under the `add_messages` reducer, tool calls arrive already normalized on `AIMessage.tool_calls`, and a test double is just another `BaseChatModel`. Nothing in this package re-implements a provider's wire format.
+
+**Embeddings default to `gemini-embedding-2` at 768 of its 3072 dimensions.**
+
+Both Gemini embedding models are Matryoshka-trained — the most significant structure is packed into the leading dimensions, so a truncated vector keeps nearly all its retrieval signal at a quarter of the storage and a quarter of the dot-product cost. Both costs are real: a bank persists every vector to JSONL, and MMR retrieval is O(k·n) dot products per episode.
+
+The reason for `-2` specifically is normalization. It renormalizes truncated output automatically; `gemini-embedding-001` does not, so a 768-dim vector from `-001` is no longer unit-norm and every consumer has to renormalize it or silently start comparing by magnitude as well as direction. `--embed-model` and `--embed-dimensions` override both.
+
+Embeddings are a *separate* model from the chat model, on purpose: a scripted or local chat model must not disable retrieval, and switching chat provider must not re-embed an existing bank into a different vector space.
+
+**One provider quirk is handled centrally** rather than at each call site: Google removed the manual sampling overrides from the Gemini API. `temperature`, `top_p` and `top_k` are deprecated there — generation is steered by the thinking level instead. `build_chat_model` strips them for any Gemini route (`gemini/`, `google_genai:`, `vertex_ai/gemini-*`, bare `gemini-*`) while leaving them intact for providers that still honour them. A config carrying `temperature: 0.4` stays correct on both.
 
 ---
 
@@ -172,7 +182,7 @@ meta_evolver/
   harness/     curriculum.py                           ← difficulty escalation
   benchmarks/  base.py, devops.py, textworld.py, custom.py, external.py
   tools/       routing.py                              ← tool governance
-  llm/         client.py, embeddings.py
+  llm/         client.py, embeddings.py                ← LangChain models
   telemetry/   engine.py
 ```
 
@@ -182,10 +192,10 @@ meta_evolver/
 
 ```bash
 pip install -e ".[dev]"
-pytest -q          # 86 tests, ~3s, no network
+pytest -q          # 98 tests, ~2s, no network
 ```
 
-The whole engine runs against `ScriptedLLMClient`, so the evolution loop, memory curation, curriculum escalation and prompt selection are all covered without an API key.
+The whole engine runs against `ScriptedChatModel` — a real `BaseChatModel`, so the graphs exercise exactly the path a live model takes (`bind_tools`, `AIMessage.tool_calls`, `ToolMessage` round-tripping) rather than a parallel mock path that can drift from it. The evolution loop, memory curation, curriculum escalation and prompt selection are all covered without an API key.
 
 ---
 

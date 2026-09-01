@@ -13,6 +13,7 @@ authors = [{ name = "Joe Mukherjee" }]
 keywords = [
     "llm-agents",
     "langgraph",
+    "langchain",
     "self-improving-agents",
     "agent-memory",
     "prompt-optimization",
@@ -29,13 +30,26 @@ classifiers = [
 ]
 dependencies = [
     "langgraph>=0.2.60",
-    "litellm>=1.50.0",
+    "langchain>=1.0",
+    "langchain-core>=0.3",
     "pydantic>=2.0",
     "rich>=13.0",
     "typer>=0.9",
 ]
 
 [project.optional-dependencies]
+# Provider integrations are optional: install the one you use. The engine
+# imports none of them directly -- `init_chat_model` resolves them by name --
+# so a missing package is a clear error at model construction rather than at
+# import time.
+google = ["langchain-google-genai>=2.0"]
+openai = ["langchain-openai>=0.2"]
+anthropic = ["langchain-anthropic>=0.3"]
+all = [
+    "langchain-google-genai>=2.0",
+    "langchain-openai>=0.2",
+    "langchain-anthropic>=0.3",
+]
 dev = ["pytest>=7.0", "pytest-cov>=4.0", "ruff>=0.6"]
 
 [project.urls]

@@ -11,9 +11,11 @@ from meta_evolver.core.rules import ActionBudget, ObservationNoise
 from meta_evolver.core.types import Action, Observation
 from meta_evolver.harness.curriculum import Curriculum
 from meta_evolver.llm.client import (
+    DEFAULT_EMBED_DIMENSIONS,
+    DEFAULT_EMBED_MODEL,
     DEPRECATED_SAMPLING_PARAMS,
-    LiteLLMClient,
     sampling_params_deprecated,
+    split_model,
 )
 from meta_evolver.tools.routing import ToolRouter
 
@@ -48,36 +50,94 @@ def test_registering_a_benchmark_is_one_decorator():
 
 @pytest.mark.parametrize(
     "model",
-    ["gemini/gemini-3-flash", "gemini-2.5-pro", "vertex_ai/gemini-3-pro", "gemini/gemini-embedding-001"],
+    [
+        "gemini/gemini-3-flash",
+        "google_genai:gemini-3-flash",
+        "gemini-2.5-pro",
+        "vertex_ai/gemini-3-pro",
+        "gemini/gemini-embedding-2",
+    ],
 )
 def test_gemini_routes_are_recognized(model):
     assert sampling_params_deprecated(model)
 
 
-@pytest.mark.parametrize("model", ["openai/gpt-4.1", "anthropic/claude-opus-4-7", "groq/llama-3.3"])
+@pytest.mark.parametrize(
+    "model", ["openai/gpt-4.1", "anthropic/claude-opus-4-7", "groq/llama-3.3"]
+)
 def test_other_providers_still_accept_sampling_params(model):
     assert not sampling_params_deprecated(model)
 
 
-def test_deprecated_sampling_params_are_stripped_for_gemini():
+@pytest.mark.parametrize(
+    ("spec", "expected"),
+    [
+        # The provider-prefixed form this project used before LangChain...
+        ("gemini/gemini-3-flash", ("google_genai", "gemini-3-flash")),
+        ("openai/gpt-4.1", ("openai", "gpt-4.1")),
+        ("vertex_ai/gemini-3-pro", ("google_vertexai", "gemini-3-pro")),
+        # ...and LangChain's own, resolving to the same place.
+        ("google_genai:gemini-3-flash", ("google_genai", "gemini-3-flash")),
+        ("anthropic:claude-opus-4-7", ("anthropic", "claude-opus-4-7")),
+        # Bare names fall back to family inference.
+        ("gemini-3-flash", ("google_genai", "gemini-3-flash")),
+        ("gpt-4.1", ("openai", "gpt-4.1")),
+    ],
+)
+def test_model_strings_accept_both_spellings(spec, expected):
+    """Existing configs and CLI invocations keep working after the move."""
+    assert split_model(spec) == expected
+
+
+def test_deprecated_sampling_params_are_stripped_for_gemini(monkeypatch):
     """Google removed the manual sampling overrides; sending them is wrong.
 
-    Enforced at the client rather than per call site, so a config carrying
-    `temperature: 0.4` stays valid on Gemini and on everything else.
+    Enforced where the model is built rather than per call site, so a config
+    carrying `temperature: 0.4` stays valid on Gemini and on everything else.
     """
-    client = LiteLLMClient(model="gemini/gemini-3-flash", api_key="test", temperature=0.4)
-    request = client._prepare(top_p=0.9, top_k=40, temperature=0.7)
+    import langchain.chat_models as lc
 
+    import meta_evolver.llm.client as client_module
+
+    captured: dict = {}
+
+    def fake_init_chat_model(name, **kwargs):
+        captured["name"] = name
+        captured["kwargs"] = kwargs
+        return object()
+
+    monkeypatch.setattr(lc, "init_chat_model", fake_init_chat_model)
+
+    client_module.build_chat_model(
+        "gemini/gemini-3-flash", temperature=0.7, top_p=0.9, top_k=40
+    )
     for param in DEPRECATED_SAMPLING_PARAMS:
-        assert param not in request
-    assert request["model"] == "gemini/gemini-3-flash"
+        assert param not in captured["kwargs"]
+    assert captured["kwargs"]["model_provider"] == "google_genai"
+    assert captured["name"] == "gemini-3-flash"
 
 
-def test_sampling_params_survive_for_providers_that_accept_them():
-    client = LiteLLMClient(model="openai/gpt-4.1", api_key="test", temperature=0.4)
-    request = client._prepare(top_p=0.9)
-    assert request["temperature"] == 0.4
-    assert request["top_p"] == 0.9
+def test_sampling_params_survive_for_providers_that_accept_them(monkeypatch):
+    import langchain.chat_models as lc
+
+    import meta_evolver.llm.client as client_module
+
+    captured: dict = {}
+    monkeypatch.setattr(
+        lc, "init_chat_model", lambda name, **kw: captured.update(kw) or object()
+    )
+
+    client_module.build_chat_model("openai/gpt-4.1", temperature=0.4, top_p=0.9)
+    assert captured["temperature"] == 0.4
+    assert captured["top_p"] == 0.9
+
+
+def test_embedding_defaults_to_gemini_embedding_2_at_reduced_width():
+    """`-2` renormalizes truncated output; `-001` leaves it non-unit-norm."""
+    provider, name = split_model(DEFAULT_EMBED_MODEL)
+    assert provider == "google_genai"
+    assert name == "gemini-embedding-2"
+    assert DEFAULT_EMBED_DIMENSIONS == 768
 
 
 # --- DevOps benchmark -------------------------------------------------------

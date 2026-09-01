@@ -42,6 +42,7 @@ import time
 from collections.abc import Sequence
 from typing import Any, Literal
 
+from langchain_core.language_models.chat_models import BaseChatModel
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
 
@@ -49,7 +50,6 @@ from meta_evolver.core.types import GenerationReport, Trajectory
 from meta_evolver.graphs.episode import run_episode
 from meta_evolver.graphs.state import EvolutionState, RolloutInput
 from meta_evolver.harness.curriculum import Curriculum
-from meta_evolver.llm.client import BaseLLMClient
 from meta_evolver.memory.bank import ReasoningMemoryBank
 from meta_evolver.memory.induction import MemoryInducer
 from meta_evolver.prompts.optimizer import PromptOptimizer
@@ -106,7 +106,7 @@ class EvolutionConfig:
 def build_evolution_graph(
     benchmark: Any,
     episode_graph: Any,
-    client: BaseLLMClient,
+    model: BaseChatModel,
     bank: ReasoningMemoryBank,
     config: EvolutionConfig | None = None,
     curriculum: Curriculum | None = None,
@@ -119,8 +119,8 @@ def build_evolution_graph(
     """
     cfg = config or EvolutionConfig()
     curr = curriculum or Curriculum()
-    inducer = MemoryInducer(client)
-    optimizer = PromptOptimizer(client)
+    inducer = MemoryInducer(model)
+    optimizer = PromptOptimizer(model)
     clock: dict[int, float] = {}
 
     # -- nodes -------------------------------------------------------------

@@ -1,25 +1,36 @@
-"""Provider-agnostic LLM access.
+"""Model access, through LangChain.
 
-One chokepoint, for one reason: request parameters have provider-specific
-validity, and scattering that knowledge across call sites guarantees drift.
-Everything that talks to a model in this package goes through ``LLMClient``.
+Chat models are LangChain ``BaseChatModel`` instances, which is what makes the
+rest of this package idiomatic LangGraph rather than LangGraph-shaped: state
+carries real ``AnyMessage`` objects under the ``add_messages`` reducer, tool
+calls arrive already normalized on ``AIMessage.tool_calls``, and a test double
+is just another ``BaseChatModel``. Nothing here re-implements a message format.
 
-The rule that motivated the design: **Google removed the manual sampling
-overrides from the Gemini API.** ``temperature``, ``top_p`` and ``top_k`` are
-deprecated there -- generation is steered by the thinking level instead. Rather
-than ask every call site to remember that, ``_prepare`` strips them for any
-Gemini route while leaving them intact for providers that still honour them.
-A config may keep ``temperature: 0.4`` and stay correct on both.
+Two provider details are handled centrally, because scattering them across
+call sites guarantees drift:
+
+**Gemini removed the manual sampling overrides.** ``temperature``, ``top_p``
+and ``top_k`` are deprecated on the Gemini API -- generation is steered by the
+thinking level instead. :func:`build_chat_model` strips them for any Gemini
+route while leaving them intact for providers that still honour them, so a
+config carrying ``temperature: 0.4`` stays correct on both.
+
+**Model strings accept either spelling.** ``gemini/gemini-3-flash`` (the
+provider-prefixed form this project used before) and
+``google_genai:gemini-3-flash`` (LangChain's) both resolve, so existing
+configs and CLI invocations keep working.
 """
 from __future__ import annotations
 
-import json
 import os
-import time
-from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
+
+from langchain_core.callbacks import CallbackManagerForLLMRun
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import AIMessage, BaseMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
 
 # --- environment ------------------------------------------------------------
 
@@ -57,22 +68,35 @@ def load_dotenv_once(start: Path | None = None) -> None:
 
 # --- model routing ----------------------------------------------------------
 
-_API_KEY_ENV: dict[str, tuple[str, ...]] = {
-    "gemini": ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
-    "openai": ("OPENAI_API_KEY",),
-    "anthropic": ("ANTHROPIC_API_KEY",),
-    "groq": ("GROQ_API_KEY",),
-    "mistral": ("MISTRAL_API_KEY",),
-    "together_ai": ("TOGETHER_API_KEY", "TOGETHERAI_API_KEY"),
+#: Prefixes this project has used, mapped to LangChain provider ids.
+_PROVIDER_ALIASES: dict[str, str] = {
+    "gemini": "google_genai",
+    "google": "google_genai",
+    "google_genai": "google_genai",
+    "google-genai": "google_genai",
+    "vertex_ai": "google_vertexai",
+    "google_vertexai": "google_vertexai",
+    "openai": "openai",
+    "anthropic": "anthropic",
+    "groq": "groq",
+    "mistral": "mistralai",
+    "mistralai": "mistralai",
+    "ollama": "ollama",
+    "together_ai": "together",
+    "together": "together",
+    "fireworks": "fireworks",
+    "openrouter": "openrouter",
 }
 
+#: Bare model names, resolved by family prefix.
 _FAMILY_PREFIXES: tuple[tuple[str, str], ...] = (
-    ("gemini", "gemini"),
+    ("gemini", "google_genai"),
     ("gpt-", "openai"),
     ("o1", "openai"),
     ("o3", "openai"),
+    ("o4", "openai"),
     ("claude", "anthropic"),
-    ("mistral", "mistral"),
+    ("mistral", "mistralai"),
     ("llama", "groq"),
 )
 
@@ -85,302 +109,248 @@ DEPRECATED_SAMPLING_PARAMS: tuple[str, ...] = (
     "topK",
 )
 
+#: Default chat model.
+DEFAULT_MODEL = "google_genai:gemini-3-flash"
 
-def split_model(model: str) -> tuple[str, str]:
-    """``"gemini/gemini-3-flash"`` -> ``("gemini", "gemini-3-flash")``."""
-    model = (model or "").strip()
-    if "/" in model:
-        provider, name = model.split("/", 1)
-        return provider, name
-    low = model.lower()
+#: Default embedding model.
+#:
+#: ``gemini-embedding-2`` over ``gemini-embedding-001`` for one reason that
+#: matters at reduced width: it **renormalizes truncated embeddings
+#: automatically**. Both are Matryoshka-trained, so a 3072-dim vector can be
+#: cut to 768 without meaningful quality loss -- but on ``-001`` the truncated
+#: vector is no longer unit-norm, and every consumer has to renormalize it or
+#: silently compare by magnitude as well as direction.
+DEFAULT_EMBED_MODEL = "google_genai:gemini-embedding-2"
+
+#: Default embedding width: 768 of the model's 3072 available dimensions.
+#:
+#: Matryoshka Representation Learning packs the most significant structure
+#: into the leading dimensions, so the first 768 carry nearly all the
+#: retrieval signal at a quarter of the storage and a quarter of the
+#: dot-product cost. Both matter here: a memory bank persists every vector to
+#: JSONL, and MMR retrieval is O(k*n) dot products per episode.
+#:
+#: Recommended values are 768, 1536 and 3072; 128-3072 is accepted. ``None``
+#: takes the model default (3072).
+DEFAULT_EMBED_DIMENSIONS = 768
+
+
+def split_model(spec: str) -> tuple[str, str]:
+    """``spec`` -> ``(langchain_provider, model_name)``.
+
+    Accepts ``provider:model`` (LangChain), ``provider/model`` (the form this
+    project used with litellm), and bare names resolved by family prefix.
+    An unrecognized provider is passed through untouched so a new LangChain
+    integration works before this table knows about it.
+    """
+    spec = (spec or "").strip()
+    if not spec:
+        return "", ""
+
+    for sep in (":", "/"):
+        if sep in spec:
+            head, tail = spec.split(sep, 1)
+            provider = _PROVIDER_ALIASES.get(head.lower())
+            if provider:
+                return provider, tail
+            if head.lower() == "models":
+                break
+            # An unknown head is still a provider hint -- a new LangChain
+            # integration should work before this table knows its name.
+            return head, tail
+
+    low = spec.lower()
     for prefix, provider in _FAMILY_PREFIXES:
         if low.startswith(prefix):
-            return provider, model
-    return "", model
+            return provider, spec
+    return "", spec
 
 
-def sampling_params_deprecated(model: str) -> bool:
-    """True when ``model`` rejects / ignores temperature, top_p and top_k.
+def qualify(spec: str) -> str:
+    """Model id in LangChain's ``provider:model`` form."""
+    provider, name = split_model(spec)
+    return f"{provider}:{name}" if provider else name
 
-    Covers every Gemini route -- the ``gemini/`` AI Studio prefix,
-    ``vertex_ai/gemini-*``, and bare ``gemini-*`` names -- so a call cannot
-    smuggle a deprecated knob through by spelling the model differently.
+
+def sampling_params_deprecated(spec: str) -> bool:
+    """True when ``spec`` rejects / ignores temperature, top_p and top_k.
+
+    Covers every Gemini route -- the ``gemini/`` and ``google_genai:``
+    prefixes, ``vertex_ai/gemini-*``, and bare ``gemini-*`` names -- so a call
+    cannot smuggle a deprecated knob through by spelling the model
+    differently.
     """
-    provider, name = split_model(model)
-    return provider == "gemini" or "gemini" in (name or "").lower()
+    provider, name = split_model(spec)
+    return provider == "google_genai" or "gemini" in (name or "").lower()
 
 
-def api_key_for(model: str) -> str | None:
-    load_dotenv_once()
-    provider, _ = split_model(model)
-    for var in _API_KEY_ENV.get(provider, ()):
-        if os.environ.get(var):
-            return os.environ[var]
-    return None
-
-
-def effective_model(model: str) -> str:
-    """``model``, unless ``$META_EVOLVER_MODEL`` overrides it run-wide.
+def effective_model(spec: str) -> str:
+    """``spec``, unless ``$META_EVOLVER_MODEL`` overrides it run-wide.
 
     One switch reaches every stage -- policy, memory induction, prompt
     optimization -- including stages behind a subprocess that inherits the
     environment but not the command line.
     """
     load_dotenv_once()
-    return os.environ.get("META_EVOLVER_MODEL") or model
-
-
-# --- responses --------------------------------------------------------------
-
-
-@dataclass
-class ToolCall:
-    id: str
-    name: str
-    arguments: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class LLMResponse:
-    content: str = ""
-    tool_calls: list[ToolCall] = field(default_factory=list)
-    tokens: int = 0
-    latency_ms: float = 0.0
-    raw: Any = None
-
-    @property
-    def has_tool_calls(self) -> bool:
-        return bool(self.tool_calls)
+    return os.environ.get("META_EVOLVER_MODEL") or spec
 
 
 class LLMError(RuntimeError):
-    """Raised when a call fails after the retry budget is spent."""
+    """Raised when a model call fails after the retry budget is spent."""
 
 
-# --- clients ----------------------------------------------------------------
+# --- construction -----------------------------------------------------------
 
 
-class BaseLLMClient:
-    """Interface every client honours. Tests substitute ``ScriptedLLMClient``."""
+def build_chat_model(
+    model: str = DEFAULT_MODEL,
+    max_retries: int = 5,
+    timeout: float | None = 120.0,
+    **kwargs: Any,
+) -> BaseChatModel:
+    """A LangChain chat model for ``model``.
 
-    model: str = ""
-
-    def complete(
-        self,
-        messages: Sequence[dict[str, Any]],
-        tools: Sequence[dict[str, Any]] | None = None,
-        response_format: dict[str, Any] | None = None,
-        max_tokens: int | None = None,
-        **kwargs: Any,
-    ) -> LLMResponse:
-        raise NotImplementedError
-
-    def embed(self, texts: Sequence[str]) -> list[list[float]] | None:
-        """Return one vector per text, or ``None`` when unavailable so the
-        caller can fall back to a local encoder."""
-        return None
-
-
-class LiteLLMClient(BaseLLMClient):
-    """litellm-backed client: any provider litellm supports.
-
-    Retries transient failures (rate limit, 5xx, connection, timeout) with
-    exponential backoff. Deterministic 4xx errors are *not* retried -- burning
-    ninety seconds of backoff to fail identically helps nobody.
+    ``max_retries`` is LangChain's own transient-error retry, which covers
+    rate limits, 5xx and connection failures without retrying a deterministic
+    400 -- burning a minute of backoff to fail identically helps nobody.
     """
+    from langchain.chat_models import init_chat_model
+
+    load_dotenv_once()
+    spec = effective_model(model)
+    provider, name = split_model(spec)
+
+    if sampling_params_deprecated(spec):
+        for param in DEPRECATED_SAMPLING_PARAMS:
+            kwargs.pop(param, None)
+
+    init_kwargs: dict[str, Any] = {"max_retries": max_retries, **kwargs}
+    if timeout is not None:
+        init_kwargs.setdefault("timeout", timeout)
+    if provider:
+        init_kwargs["model_provider"] = provider
+
+    try:
+        return init_chat_model(name, **init_kwargs)
+    except Exception as exc:
+        raise LLMError(
+            f"could not build chat model {spec!r} "
+            f"(provider={provider or 'inferred'}, model={name!r}): {exc}. "
+            "Install the provider package, e.g. `pip install langchain-google-genai`."
+        ) from exc
+
+
+def model_name(model: BaseChatModel) -> str:
+    """A readable identifier for a chat model, for logs and reports."""
+    for attr in ("model", "model_name", "_llm_type"):
+        value = getattr(model, attr, None)
+        if isinstance(value, str) and value:
+            return value
+    return type(model).__name__
+
+
+def message_text(message: BaseMessage) -> str:
+    """Plain text of a message, whether its content is a string or blocks.
+
+    LangChain models may reply with structured content blocks rather than a
+    plain string; stringifying those directly would put a list repr into a
+    prompt, which is the kind of bug that surfaces as "the optimizer got
+    worse" rather than as an error.
+    """
+    content = message.content
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict) and block.get("type") == "text":
+                parts.append(str(block.get("text", "")))
+        return "".join(parts)
+    return str(content or "")
+
+
+def invoke_text(model: BaseChatModel, messages: Sequence[BaseMessage], **kwargs: Any) -> str:
+    """Invoke ``model`` and return its text content.
+
+    Wraps provider exceptions in :class:`LLMError` so the graph's error
+    handling has one type to catch.
+    """
+    try:
+        response = model.invoke(list(messages), **kwargs)
+    except Exception as exc:
+        raise LLMError(f"{type(exc).__name__}: {exc}") from exc
+    return message_text(response)
+
+
+# --- test double ------------------------------------------------------------
+
+
+class ScriptedChatModel(BaseChatModel):
+    """A deterministic ``BaseChatModel`` for tests and offline demos.
+
+    Takes either a fixed script of ``AIMessage`` replies or a callable policy
+    over the message list. Because it is a real chat model, the whole engine
+    -- episode graph, evolution graph, memory, curriculum -- runs against it
+    end to end with no network, which is how the test suite stays fast.
+
+    ``bind_tools`` records what it was offered and returns ``self``, so a test
+    can assert on the tool set the agent was actually shown.
+    """
+
+    responder: Any = None
+    script: list[Any] = []
+    calls: list[Any] = []
+    bound_tools: list[Any] | None = None
+    cursor: int = 0
+
+    model_config = {"arbitrary_types_allowed": True}
 
     def __init__(
         self,
-        model: str = "gemini/gemini-3-flash",
-        embed_model: str = "gemini/gemini-embedding-001",
-        api_key: str | None = None,
-        api_base: str | None = None,
-        temperature: float | None = None,
-        max_tokens: int | None = 4096,
-        max_retries: int = 5,
-        retry_initial_delay: float = 1.0,
-        retry_max_delay: float = 30.0,
-        **defaults: Any,
-    ) -> None:
-        self.model = effective_model(model)
-        self.embed_model = embed_model
-        self.api_key = api_key or api_key_for(self.model)
-        self.api_base = api_base
-        self.temperature = temperature
-        self.max_tokens = max_tokens
-        self.max_retries = int(max_retries)
-        self.retry_initial_delay = float(retry_initial_delay)
-        self.retry_max_delay = float(retry_max_delay)
-        self.defaults = defaults
-        self.n_calls = 0
-        self.n_tokens = 0
-
-    # -- request construction ---------------------------------------------
-
-    def _prepare(self, **overrides: Any) -> dict[str, Any]:
-        """Build request kwargs the target provider will actually accept."""
-        kwargs: dict[str, Any] = {**self.defaults, **overrides}
-        kwargs["model"] = self.model
-        if self.api_key:
-            kwargs["api_key"] = self.api_key
-        if self.api_base:
-            kwargs["api_base"] = self.api_base
-        kwargs.setdefault("max_tokens", self.max_tokens)
-        if self.temperature is not None:
-            kwargs.setdefault("temperature", self.temperature)
-
-        if sampling_params_deprecated(self.model):
-            # Gemini: the sampling overrides are gone. Drop rather than send.
-            for param in DEPRECATED_SAMPLING_PARAMS:
-                kwargs.pop(param, None)
-
-        return {k: v for k, v in kwargs.items() if v is not None}
-
-    # -- calls -------------------------------------------------------------
-
-    def complete(
-        self,
-        messages: Sequence[dict[str, Any]],
-        tools: Sequence[dict[str, Any]] | None = None,
-        response_format: dict[str, Any] | None = None,
-        max_tokens: int | None = None,
+        script: Sequence[AIMessage] | None = None,
+        responder: Callable[[list[BaseMessage], list[Any] | None], AIMessage] | None = None,
         **kwargs: Any,
-    ) -> LLMResponse:
-        import litellm
-
-        litellm.suppress_debug_info = True
-        litellm.drop_params = True
-
-        req = self._prepare(max_tokens=max_tokens or self.max_tokens, **kwargs)
-        req["messages"] = list(messages)
-        if tools:
-            req["tools"] = list(tools)
-            req.setdefault("tool_choice", "auto")
-        if response_format:
-            req["response_format"] = response_format
-
-        transient = _transient_exception_types(litellm)
-        started = time.time()
-        last: Exception | None = None
-
-        for attempt in range(self.max_retries + 1):
-            try:
-                raw = litellm.completion(**req)
-                break
-            except transient as exc:  # noqa: PERF203 - retry is the point
-                last = exc
-                if attempt == self.max_retries:
-                    raise LLMError(f"{type(exc).__name__}: {exc}") from exc
-                delay = min(self.retry_max_delay, self.retry_initial_delay * 2**attempt)
-                time.sleep(delay)
-            except Exception as exc:
-                raise LLMError(f"{type(exc).__name__}: {exc}") from exc
-        else:  # pragma: no cover - loop always breaks or raises
-            raise LLMError(str(last))
-
-        return self._parse(raw, (time.time() - started) * 1000.0)
-
-    def _parse(self, raw: Any, latency_ms: float) -> LLMResponse:
-        message = raw.choices[0].message
-        calls: list[ToolCall] = []
-        for i, tc in enumerate(getattr(message, "tool_calls", None) or []):
-            args = tc.function.arguments
-            if isinstance(args, str):
-                try:
-                    args = json.loads(args)
-                except (json.JSONDecodeError, TypeError):
-                    args = {"_raw": args}
-            calls.append(
-                ToolCall(id=tc.id or f"call_{i}", name=tc.function.name, arguments=args or {})
-            )
-
-        tokens = 0
-        usage = getattr(raw, "usage", None)
-        if usage is not None:
-            tokens = int(getattr(usage, "total_tokens", 0) or 0)
-
-        self.n_calls += 1
-        self.n_tokens += tokens
-        return LLMResponse(
-            content=message.content or "",
-            tool_calls=calls,
-            tokens=tokens,
-            latency_ms=latency_ms,
-            raw=raw,
-        )
-
-    def embed(self, texts: Sequence[str]) -> list[list[float]] | None:
-        import litellm
-
-        try:
-            kwargs: dict[str, Any] = {"model": self.embed_model, "input": list(texts)}
-            key = api_key_for(self.embed_model)
-            if key:
-                kwargs["api_key"] = key
-            resp = litellm.embedding(**kwargs)
-            return [row["embedding"] for row in resp.data]
-        except Exception:
-            # Callers fall back to the deterministic local encoder. An
-            # embedding outage should degrade retrieval quality, not stop a run.
-            return None
-
-
-def _transient_exception_types(litellm_module: Any) -> tuple[type[BaseException], ...]:
-    """Exception classes worth retrying, resolved dynamically.
-
-    litellm's module layout has shifted across releases; naming them by string
-    keeps this working across versions. ``APIError`` (the base class) is
-    excluded on purpose -- it covers deterministic 400s too.
-    """
-    out: list[type[BaseException]] = []
-    for name in (
-        "APIConnectionError",
-        "RateLimitError",
-        "ServiceUnavailableError",
-        "InternalServerError",
-        "Timeout",
-    ):
-        cls = getattr(litellm_module, name, None)
-        if isinstance(cls, type) and issubclass(cls, BaseException):
-            out.append(cls)
-    return tuple(out) or (ConnectionError,)
-
-
-class ScriptedLLMClient(BaseLLMClient):
-    """Deterministic client for tests and offline demos.
-
-    Accepts either a fixed script of responses or a callable policy over the
-    message list. The whole engine -- episode graph, evolution graph, memory,
-    curriculum -- runs end to end against this, which is how the test suite
-    stays fast and network-free.
-    """
-
-    def __init__(
-        self,
-        script: Iterable[LLMResponse] | None = None,
-        responder: Callable[[list[dict[str, Any]], list[dict[str, Any]] | None], LLMResponse]
-        | None = None,
-        model: str = "scripted/deterministic",
     ) -> None:
         if script is not None and responder is not None:
             raise ValueError("pass either script or responder, not both")
-        self.model = model
+        super().__init__(**kwargs)
         self.script = list(script or [])
         self.responder = responder
-        self._idx = 0
-        self.calls: list[list[dict[str, Any]]] = []
+        self.calls = []
+        self.bound_tools = None
+        self.cursor = 0
 
-    def complete(self, messages, tools=None, response_format=None, max_tokens=None, **kwargs):
+    @property
+    def _llm_type(self) -> str:
+        return "scripted"
+
+    def bind_tools(self, tools: Sequence[Any], **kwargs: Any) -> ScriptedChatModel:
+        self.bound_tools = list(tools)
+        return self
+
+    def _generate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: CallbackManagerForLLMRun | None = None,
+        **kwargs: Any,
+    ) -> ChatResult:
         self.calls.append(list(messages))
         if self.responder is not None:
-            return self.responder(list(messages), list(tools) if tools else None)
-        if self._idx >= len(self.script):
-            return LLMResponse(content="(end of script)")
-        resp = self.script[self._idx]
-        self._idx += 1
-        return resp
+            reply = self.responder(list(messages), self.bound_tools)
+        elif self.cursor < len(self.script):
+            reply = self.script[self.cursor]
+            self.cursor += 1
+        else:
+            reply = AIMessage(content="(end of script)")
+        return ChatResult(generations=[ChatGeneration(message=reply)])
 
 
-def build_client(model: str | None = None, **kwargs: Any) -> BaseLLMClient:
-    """Default client factory used by the CLI and the graphs."""
-    return LiteLLMClient(model=model or "gemini/gemini-3-flash", **kwargs)
+def tool_call_message(name: str, call_id: str = "call_1", **args: Any) -> AIMessage:
+    """An ``AIMessage`` carrying one tool call. Convenience for tests."""
+    return AIMessage(
+        content="",
+        tool_calls=[{"name": name, "args": args, "id": call_id, "type": "tool_call"}],
+    )
