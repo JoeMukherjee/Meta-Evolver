@@ -17,6 +17,7 @@ held-out number should be measured with.
 """
 from __future__ import annotations
 
+import os
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
@@ -32,6 +33,7 @@ from meta_evolver.harness.curriculum import Curriculum
 from meta_evolver.llm.client import DEFAULT_MODEL, build_chat_model, model_name
 from meta_evolver.llm.embeddings import Embedder
 from meta_evolver.memory.bank import ReasoningMemoryBank
+from meta_evolver.storage.base import DB_URL_ENV
 from meta_evolver.telemetry.engine import TelemetryEngine
 
 
@@ -45,6 +47,7 @@ class MetaEvolver:
         chat_model: BaseChatModel | None = None,
         bank: ReasoningMemoryBank | None = None,
         memory_path: str | Path | None = None,
+        db_url: str | None = None,
         embed_model: str | None = None,
         embed_dimensions: int | None = None,
         config: EvolutionConfig | None = None,
@@ -75,6 +78,15 @@ class MetaEvolver:
             # bank's default -- the configuration would appear to apply while
             # every vector came from a different model.
             self.bank.embedder = self.embedder
+        elif db_url or os.environ.get(DB_URL_ENV):
+            # Namespaced by benchmark so one database serves several without
+            # their lessons retrieving each other.
+            self.bank = ReasoningMemoryBank.connect(
+                db_url,
+                namespace=self.benchmark.name,
+                embedder=self.embedder,
+                dim=embed_dimensions,
+            )
         elif memory_path is not None:
             self.bank = ReasoningMemoryBank.load(memory_path, embedder=self.embedder)
         else:
@@ -158,6 +170,7 @@ class MetaEvolver:
                 "benchmark": self.benchmark.name,
                 "model": self.model_name,
                 "memory": self.bank.stats(),
+                "memory_backend": self.bank.backend,
                 "prompt_version": self.prompt_version,
                 "curriculum": self.curriculum.describe(self.curriculum_level),
             }
@@ -232,10 +245,19 @@ class MetaEvolver:
         return TelemetryEngine.render_progress(self.reports)
 
     def save(self, memory_path: str | Path | None = None, prompt_path: str | Path | None = None):
-        """Persist what was learned: the bank and the evolved prompt."""
-        out: dict[str, Path] = {}
-        target = memory_path or self.bank.path or (self.telemetry.run_dir / "memories.jsonl")
-        out["memory"] = self.bank.save(target)
+        """Persist what was learned: the bank and the evolved prompt.
+
+        A database-backed bank has already been written through on every add,
+        prune and credit pass, so this only flushes the current items and
+        reports the backend. Passing ``memory_path`` explicitly exports to a
+        file regardless, which is how you snapshot a shared bank.
+        """
+        out: dict[str, Path | str] = {}
+        if self.bank.store is not None and memory_path is None:
+            out["memory"] = self.bank.save()
+        else:
+            target = memory_path or self.bank.path or (self.telemetry.run_dir / "memories.jsonl")
+            out["memory"] = self.bank.save(target)
         prompt_target = Path(prompt_path or (self.telemetry.run_dir / "prompt.txt"))
         prompt_target.parent.mkdir(parents=True, exist_ok=True)
         prompt_target.write_text(self.prompt_template, encoding="utf-8")

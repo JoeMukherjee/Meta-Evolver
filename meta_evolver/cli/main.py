@@ -26,6 +26,7 @@ from meta_evolver.core.registry import get_benchmark, list_benchmarks
 from meta_evolver.core.types import GenerationReport
 from meta_evolver.graphs.evolution import EvolutionConfig
 from meta_evolver.llm.client import DEFAULT_EMBED_MODEL, DEFAULT_MODEL
+from meta_evolver.storage.base import DB_URL_ENV
 
 app = typer.Typer(
     help="Meta-Evolver: a LangGraph engine for agents that improve on any benchmark.",
@@ -111,6 +112,14 @@ def evolve(
     generations: int = typer.Option(5),
     max_steps: int = typer.Option(15),
     memory: Path | None = typer.Option(None, help="Memory bank JSONL to load and update."),
+    db_url: str | None = typer.Option(
+        None,
+        "--db-url",
+        help=(
+            "Postgres or MongoDB connection string for the memory bank. "
+            f"Defaults to ${DB_URL_ENV}; without either, a JSONL file is used."
+        ),
+    ),
     run_dir: Path | None = typer.Option(None, help="Where telemetry is written."),
     patience: int = typer.Option(6, help="Steps without progress before memory is evicted."),
     retrieval_k: int = typer.Option(4),
@@ -137,6 +146,7 @@ def evolve(
         embed_model=embed_model,
         embed_dimensions=embed_dimensions,
         memory_path=memory,
+        db_url=db_url,
         run_dir=run_dir,
         config=config,
         controller_config=AdaptiveControllerConfig(patience=patience),
@@ -146,6 +156,7 @@ def evolve(
         f"[bold]{evolver.benchmark.name}[/bold] via [cyan]{evolver.model_name}[/cyan] "
         f"-- {generations} generations, {len(evolver.benchmark.task_ids('train'))} train tasks"
     )
+    console.print(f"memory:     [cyan]{evolver.bank.backend}[/cyan]")
     console.print(
         f"embeddings: [cyan]{embed_model}[/cyan] at {embed_dimensions} dims"
         f"{'' if evolver.embedder.remote_available else ' [yellow](unavailable; using local encoder)[/yellow]'}"
@@ -181,7 +192,8 @@ def ablate(
     model: str = typer.Option(DEFAULT_MODEL),
     embed_model: str = typer.Option(DEFAULT_EMBED_MODEL, help="Embedding model."),
     embed_dimensions: int = typer.Option(768, help="Embedding width (128-3072)."),
-    memory: Path = typer.Option(..., help="Memory bank JSONL to evaluate."),
+    memory: Path | None = typer.Option(None, help="Memory bank JSONL to evaluate."),
+    db_url: str | None = typer.Option(None, "--db-url", help="Database bank to evaluate."),
     split: str = typer.Option("eval"),
     max_steps: int = typer.Option(15),
 ) -> None:
@@ -197,10 +209,12 @@ def ablate(
         embed_model=embed_model,
         embed_dimensions=embed_dimensions,
         memory_path=memory,
+        db_url=db_url,
         config=EvolutionConfig(max_steps=max_steps),
         telemetry=False,
     )
-    console.print(f"bank: {evolver.bank.stats()}\n")
+    console.print(f"bank: {evolver.bank.backend}")
+    console.print(f"      {evolver.bank.stats()}\n")
 
     with_memory = evolver.evaluate(split=split, use_memory=True)
     without = evolver.evaluate(split=split, use_memory=False)

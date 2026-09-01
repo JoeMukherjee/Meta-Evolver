@@ -15,6 +15,13 @@ meta-evolver ablate --memory memories.jsonl   # prove the memory is worth it
 
 No key handy? `python examples/offline_demo.py` runs the entire system against a scripted model in about a second.
 
+Want the memory bank in a real database rather than a file?
+
+```bash
+docker compose -f docker/docker-compose.yml up -d postgres
+export META_EVOLVER_DB_URL=postgresql://meta:meta@localhost:5433/meta_evolver
+```
+
 ---
 
 ## The idea
@@ -93,6 +100,33 @@ The `textgame` benchmark's eval split exists to test this: its layouts put the t
 
 ---
 
+## Where the memory lives
+
+A memory bank is state that outlives a run, is written concurrently, and is
+queried by similarity. A JSONL file handles one of those, which is why storage
+is pluggable — pick a backend with a URL and nothing else changes.
+
+| Backend | URL | What it adds |
+|---|---|---|
+| **File** (default) | `memories.jsonl` | Nothing to install. Atomic replace on write, so an interrupted save cannot destroy the bank. |
+| **Postgres + pgvector** | `postgresql://…` | Atomic credit increments, server-side ANN, one bank shared across runs. |
+| **MongoDB** | `mongodb://…` | Durability and safe concurrent writes. Vector search only on Atlas; otherwise it says so and the bank scores in Python. |
+
+```bash
+meta-evolver evolve --db-url postgresql://meta:meta@localhost:5433/meta_evolver
+# or set $META_EVOLVER_DB_URL once and every entry point picks it up
+```
+
+Two reasons the database is not cosmetic:
+
+**Credit assignment is a race.** Rollouts fan out concurrently and all credit the same memories. Under a read-modify-write, increments are lost, utilities drift low, and the pruner deletes memories that were doing fine — and the symptom is "the bank stopped improving", not an error. In SQL it is `uses = uses + 1`, and the race does not exist.
+
+**Retrieval stops being O(n).** Embeddings live in a `vector` column with an HNSW cosine index. The query pulls a candidate *pool* rather than exactly `k`, because MMR re-ranks it and diversity needs alternatives to choose between.
+
+Memories are scoped by `namespace` (the benchmark name), so one database serves several. That scoping is in the primary key, not just the `WHERE` clause: a memory's id is derived from its text, so two benchmarks that independently learn the same lesson derive the same id — and keyed on the id alone, the second write lands in the first's namespace, where its author cannot read it.
+
+---
+
 ## Plugging in your own benchmark
 
 One class, three methods, one decorator:
@@ -164,6 +198,8 @@ Both Gemini embedding models are Matryoshka-trained — the most significant str
 
 The reason for `-2` specifically is normalization. It renormalizes truncated output automatically; `gemini-embedding-001` does not, so a 768-dim vector from `-001` is no longer unit-norm and every consumer has to renormalize it or silently start comparing by magnitude as well as direction. `--embed-model` and `--embed-dimensions` override both.
 
+Queries and stored memories are embedded **asymmetrically** — `RETRIEVAL_QUERY` for what searches the bank, `RETRIEVAL_DOCUMENT` for what goes into it. They project into the same space from different sides, and using the document side for both discards signal the model was trained to provide.
+
 Embeddings are a *separate* model from the chat model, on purpose: a scripted or local chat model must not disable retrieval, and switching chat provider must not re-embed an existing bank into a different vector space.
 
 **One provider quirk is handled centrally** rather than at each call site: Google removed the manual sampling overrides from the Gemini API. `temperature`, `top_p` and `top_k` are deprecated there — generation is steered by the thinking level instead. `build_chat_model` strips them for any Gemini route (`gemini/`, `google_genai:`, `vertex_ai/gemini-*`, bare `gemini-*`) while leaving them intact for providers that still honour them. A config carrying `temperature: 0.4` stays correct on both.
@@ -183,6 +219,7 @@ meta_evolver/
   benchmarks/  base.py, devops.py, textworld.py, custom.py, external.py
   tools/       routing.py                              ← tool governance
   llm/         client.py, embeddings.py                ← LangChain models
+  storage/     jsonl.py, postgres.py, mongo.py       ← pluggable persistence
   telemetry/   engine.py
 ```
 
@@ -192,7 +229,15 @@ meta_evolver/
 
 ```bash
 pip install -e ".[dev]"
-pytest -q          # 98 tests, ~2s, no network
+pytest -q          # 131 tests, no network; DB tests skip if nothing is listening
+```
+
+To exercise the database backends too:
+
+```bash
+docker compose -f docker/docker-compose.yml up -d postgres
+docker compose -f docker/docker-compose.yml --profile mongo up -d mongo
+pytest -q          # the storage contract now runs against all three
 ```
 
 The whole engine runs against `ScriptedChatModel` — a real `BaseChatModel`, so the graphs exercise exactly the path a live model takes (`bind_tools`, `AIMessage.tool_calls`, `ToolMessage` round-tripping) rather than a parallel mock path that can drift from it. The evolution loop, memory curation, curriculum escalation and prompt selection are all covered without an API key.
