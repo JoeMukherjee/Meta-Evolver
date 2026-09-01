@@ -65,6 +65,7 @@ from meta_evolver.graphs.state import EpisodeRuntime, EpisodeState
 from meta_evolver.llm.client import message_text
 from meta_evolver.memory.bank import ReasoningMemoryBank
 from meta_evolver.prompts.templates import render_system_prompt
+from meta_evolver.tools.assertions import AssertionRunner
 from meta_evolver.tools.routing import ToolRouter
 
 #: Cap on consecutive turns where the model answers with prose instead of a
@@ -80,6 +81,8 @@ def build_episode_graph(
     controller_config: AdaptiveControllerConfig | None = None,
     observation_chars: int = 4000,
     tool_router: ToolRouter | None = None,
+    assertion_runner: AssertionRunner | None = None,
+    max_assertion_retries: int = 3,
     checkpointer: Any = None,
 ):
     """Compile the episode graph.
@@ -143,6 +146,9 @@ def build_episode_graph(
             "steps": [],
             "step_idx": 0,
             "nudges": 0,
+            "assertion_retries": 0,
+            "assertion_warnings": [],
+            "pending_assertion_failures": [],
             "terminated": False,
             "truncated": False,
             "reward": 0.0,
@@ -195,13 +201,52 @@ def build_episode_graph(
             return {"pending_action": None, "pending_thought": thought, "tokens": tokens}
 
         call = reply.tool_calls[0]
+        proposed_action = Action(name=call["name"], kwargs=call.get("args") or {})
+
+        # Run in-flight assertions if configured
+        if assertion_runner is not None:
+            env_st = getattr(env, "get_env_state", lambda: {})()
+            results = assertion_runner.evaluate(proposed_action, state, env_st)
+            hard = assertion_runner.hard_failures(results)
+            soft = assertion_runner.soft_warnings(results)
+
+            if hard and state.get("assertion_retries", 0) < max_assertion_retries:
+                return {
+                    "pending_action": None,
+                    "pending_thought": thought,
+                    "pending_assertion_failures": [h.message for h in hard],
+                    "assertion_warnings": [s.message for s in soft],
+                    "tokens": tokens,
+                    "nudges": 0,
+                }
+
         return {
             "messages": [reply],
             "pending_action": {"name": call["name"], "kwargs": call.get("args") or {}},
             "pending_thought": thought,
             "pending_tool_call_id": call.get("id") or f"call_{state.get('step_idx', 0) + 1}",
+            "pending_assertion_failures": [],
             "tokens": tokens,
             "nudges": 0,
+        }
+
+    async def assert_retry(state: EpisodeState) -> dict[str, Any]:
+        """An assertion failed. Feed back the error without advancing the environment."""
+        failures = state.get("pending_assertion_failures") or ["Action validation check failed."]
+        thought = state.get("pending_thought", "")
+        feedback_text = "; ".join(failures)
+        return {
+            "assertion_retries": state.get("assertion_retries", 0) + 1,
+            "pending_assertion_failures": [],
+            "messages": [
+                AIMessage(content=thought or "(attempted action)"),
+                HumanMessage(
+                    content=(
+                        f"Action validation assertion failed: {feedback_text}\n"
+                        f"Please correct your action call or parameters and try again."
+                    )
+                ),
+            ],
         }
 
     async def nudge(state: EpisodeState) -> dict[str, Any]:
@@ -265,6 +310,8 @@ def build_episode_graph(
             "terminated": bool(resp.terminated),
             "truncated": bool(resp.truncated),
             "pending_action": None,
+            "assertion_retries": 0,
+            "pending_assertion_failures": [],
             "messages": [
                 ToolMessage(
                     content=str(tool_content), tool_call_id=call_id, name=action.name
@@ -332,9 +379,13 @@ def build_episode_graph(
 
     # -- routing -----------------------------------------------------------
 
-    def route_after_think(state: EpisodeState) -> Literal["act", "nudge", "finalize"]:
+    def route_after_think(
+        state: EpisodeState,
+    ) -> Literal["act", "nudge", "assert_retry", "finalize"]:
         if state.get("error"):
             return "finalize"
+        if state.get("pending_assertion_failures"):
+            return "assert_retry"
         if state.get("pending_action"):
             return "act"
         if state.get("nudges", 0) >= MAX_NUDGES:
@@ -360,13 +411,17 @@ def build_episode_graph(
     graph.add_node("prepare", prepare)
     graph.add_node("think", think)
     graph.add_node("nudge", nudge)
+    graph.add_node("assert_retry", assert_retry)
     graph.add_node("act", act)
     graph.add_node("adapt", adapt)
     graph.add_node("finalize", finalize)
 
     graph.add_edge(START, "prepare")
     graph.add_edge("prepare", "think")
-    graph.add_conditional_edges("think", route_after_think, ["act", "nudge", "finalize"])
+    graph.add_conditional_edges(
+        "think", route_after_think, ["act", "nudge", "assert_retry", "finalize"]
+    )
+    graph.add_edge("assert_retry", "think")
     graph.add_conditional_edges("nudge", route_after_nudge, ["think", "finalize"])
     graph.add_conditional_edges("act", route_after_act, ["adapt", "finalize"])
     graph.add_conditional_edges("adapt", route_after_adapt, ["think", "finalize"])

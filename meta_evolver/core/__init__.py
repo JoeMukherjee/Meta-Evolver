@@ -1,5 +1,11 @@
 """Core contracts: types, the environment interface, harnesses, the registry."""
 from meta_evolver.core.env import ActionableEnv, EnvHarness
+from meta_evolver.core.flex import (
+    FlexModule,
+    FlexProposer,
+    FlexResult,
+    FlexRule,
+)
 from meta_evolver.core.registry import (
     get_benchmark,
     list_benchmarks,
@@ -35,6 +41,10 @@ __all__ = [
     "EnvResetResponse",
     "EnvResponse",
     "EvaluationResult",
+    "FlexModule",
+    "FlexProposer",
+    "FlexResult",
+    "FlexRule",
     "GenerationReport",
     "IntermittentFault",
     "MemoryItem",

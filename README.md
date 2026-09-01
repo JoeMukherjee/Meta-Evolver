@@ -229,6 +229,33 @@ See [`examples/custom_benchmark.py`](examples/custom_benchmark.py) for the whole
 
 ---
 
+## Advanced Scaffolding Subsystems (API LLM / Frozen-Weight Optimization)
+
+Meta-Evolver operates entirely at the **scaffolding layer**, enabling continuous self-improvement across API-only LLMs without modifying foundation model weights:
+
+1. **In-Flight Assertions & Backtracking (`ScaffoldAssert`)**
+   - Intercepts ill-formed tool calls, invalid schemas, and domain constraint violations *before* execution.
+   - Triggers intra-step feedback loops (`assert_retry` node) to allow the agent to correct actions without advancing the environment step counter.
+
+2. **Feedback-Driven Multi-Component Reflection (`GEPAPromptOptimizer`)**
+   - Decomposes the prompt into modular components (`planning`, `tool_policy`, `error_recovery`, `core_role`).
+   - Tracks a population across multiple tasks and samples candidate parents from the non-dominated **Pareto frontier**.
+   - Supports component-level reflective mutations and crossover merges between Pareto parents.
+
+3. **Sandbox Variable REPL & Context Navigation (`ScaffoldRLM`)**
+   - Separates **Variable Space** from **Token Space** for massive observations (long logs, large DOM trees, dataframes).
+   - Injects lightweight `VariableDescriptor` metadata into the prompt; the agent executes sandboxed Python code to slice data and delegates sub-queries to `llm_query` with strict call budgets.
+
+4. **Dynamic Code Scaffolding Evolution (`FlexScaffold`)**
+   - Moves executable Python module code into the optimizable parameter space (`FlexModule`).
+   - Compiles and runs dynamically synthesized tools and `FlexRule` harness wrappers in isolated execution sandboxes with crash resilience.
+
+5. **OpenTelemetry & MLflow Visual Tracing (`TelemetryTracer`)**
+   - Step-level hierarchical span tracking recording node latencies, token consumption, and intermediate events.
+   - Exports directly to standard **MLflow Trace UI** format and **OpenTelemetry JSON** for observability in local or cloud dashboards.
+
+---
+
 ## Built-in benchmarks
 
 Both are self-contained, deterministic, and run offline — no dataset download, no simulator install, so a behaviour regression shows up as a failing test rather than a drifting number nobody can reproduce.
@@ -263,19 +290,19 @@ Embeddings are a *separate* model from the chat model, on purpose: a scripted or
 
 ```
 meta_evolver/
-  core/        types, ActionableEnv, Rules harness, registry, seeding
-  graphs/      episode.py, evolution.py, state.py      ← the LangGraph engine
+  core/        types, ActionableEnv, Rules harness, flex (dynamic code), registry, seeding
+  graphs/      episode.py (assertions + backtracks), evolution.py, state.py
   memory/      bank.py (MMR + credit + prune), induction.py
   adaptive/    controller.py, tracker.py               ← OOD mitigation
-  prompts/     optimizer.py (OPRO), templates.py
+  prompts/     optimizer.py (OPRO), gepa.py (multi-component Pareto), templates.py
   harness/     curriculum.py                           ← difficulty escalation
   benchmarks/  base.py, devops.py, textworld.py, custom.py, external.py
-  tools/       routing.py                              ← tool governance
+  tools/       routing.py, assertions.py, repl.py (ScaffoldRLM)
   llm/         client.py, embeddings.py                ← LangChain models
   storage/     jsonl.py, postgres.py, mongo.py       ← pluggable persistence
                checkpoint.py                          ← resumable runs
   graph_view/  recorder.py, schema.py                 ← the causal graph
-  telemetry/   engine.py
+  telemetry/   engine.py, tracer.py (OTel / MLflow traces)
 ```
 
 ---
