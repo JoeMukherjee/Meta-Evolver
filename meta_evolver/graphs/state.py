@@ -5,19 +5,21 @@ the accumulating fields, which is what lets LangGraph merge concurrent node
 returns instead of last-writer-wins.
 
 A note on what lives in state and what does not. Live objects -- the
-environment, the LLM client, the memory bank -- are *not* state. They are not
-serializable, so putting them in state breaks checkpointing, and they are
-shared rather than per-branch, so a reducer over them is meaningless. They are
-bound into the node closures at build time instead; state carries only the
-data that describes the run.
+environment, the chat model, the memory bank -- are *not* state. They do not
+serialize, so a checkpointer rejects them outright, and they are shared rather
+than per-branch, so a reducer over them is meaningless.
 
-The exception is ``env`` and ``controller`` on ``EpisodeState``: an episode is
-inseparable from its environment instance, and the whole episode graph runs
-within a single ``invoke`` on one thread. They are marked as such below.
+Things shared by every episode (the model, the bank) are bound into the node
+closures at build time. Things that differ *per episode* -- the environment,
+and the adaptive controller built for it -- travel in LangGraph's
+``configurable`` channel as an :class:`EpisodeRuntime`, which is passed
+per-invoke and never checkpointed. State then carries only data that
+round-trips through msgpack, which is what makes checkpointing work at all.
 """
 from __future__ import annotations
 
 import operator
+from dataclasses import dataclass
 from typing import Annotated, Any, TypedDict
 
 from langchain_core.messages import AnyMessage
@@ -36,6 +38,20 @@ def _last(_old: Any, new: Any) -> Any:
     return new
 
 
+@dataclass
+class EpisodeRuntime:
+    """The live objects one episode needs, kept out of checkpointed state.
+
+    Passed through ``config["configurable"]["runtime"]``. Nodes mutate it in
+    place -- ``prepare`` builds the controller here -- which is safe because a
+    single ``ainvoke`` owns exactly one of these and never shares it across
+    concurrent rollouts.
+    """
+
+    env: Any
+    controller: Any = None
+
+
 class EpisodeState(TypedDict, total=False):
     """State of one agent episode.
 
@@ -51,13 +67,17 @@ class EpisodeState(TypedDict, total=False):
     benchmark: str
     instruction: str
     generation: int
+    rollout_index: int
+    """Which attempt at this task, when a generation runs several (MaTTS).
+
+    Declared here and not only on ``RolloutInput``: LangGraph drops initial
+    keys the state schema does not know, so leaving it out made every attempt
+    report index 0 -- indistinguishable in the trajectory record and colliding
+    on the same node in the causal graph."""
+
     prompt_template: str
     prompt_version: str
     max_steps: int
-
-    # -- live handles (single-threaded within one episode invoke) ----------
-    env: Any
-    controller: Any
 
     # -- accumulating ------------------------------------------------------
     messages: Annotated[list[AnyMessage], add_messages]
@@ -122,6 +142,15 @@ class EvolutionState(TypedDict, total=False):
     validation_pass_rate: float | None
     prompt_note: str
 
+    induction_tokens: int
+    optimization_tokens: int
+    """Metered inside the node that spends them.
+
+    LangGraph runs each node in its own context, so a usage callback entered
+    in one node cannot be closed in another -- resetting the context variable
+    raises. Each spending node therefore meters itself and reports a number,
+    and ``checkpoint`` adds them to the rollouts' own totals."""
+
     # -- history / control -------------------------------------------------
     last_outcomes: dict[str, bool]
     """``task_id -> success`` from the previous generation, for regression
@@ -147,3 +176,5 @@ class RolloutInput(TypedDict, total=False):
     curriculum_level: float
     prompt_template: str
     prompt_version: str
+    rollout_index: int
+    """Which attempt at this task, when running more than one (MaTTS)."""

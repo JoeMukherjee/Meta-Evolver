@@ -202,10 +202,36 @@ class LLMError(RuntimeError):
 # --- construction -----------------------------------------------------------
 
 
+def build_rate_limiter(requests_per_second: float | None) -> Any:
+    """A client-side limiter, or ``None`` to leave requests unthrottled.
+
+    Rollouts fan out concurrently against one API key, so the natural failure
+    is a burst of 429s at the start of every generation. Retries recover from
+    that but pay full backoff for it; pacing the requests is cheaper and makes
+    a run's wall-clock predictable.
+
+    ``check_every_n_seconds`` is deliberately much finer than the rate: the
+    limiter sleeps in those increments, so a coarse value would quantise every
+    request onto a slow tick.
+    """
+    if not requests_per_second or requests_per_second <= 0:
+        return None
+    from langchain_core.rate_limiters import InMemoryRateLimiter
+
+    return InMemoryRateLimiter(
+        requests_per_second=float(requests_per_second),
+        check_every_n_seconds=min(0.1, 1.0 / (float(requests_per_second) * 4)),
+        # Allow a small burst so a generation's first few rollouts start
+        # immediately rather than queuing behind the very first tick.
+        max_bucket_size=max(1.0, float(requests_per_second)),
+    )
+
+
 def build_chat_model(
     model: str = DEFAULT_MODEL,
     max_retries: int = 5,
     timeout: float | None = 120.0,
+    requests_per_second: float | None = None,
     **kwargs: Any,
 ) -> BaseChatModel:
     """A LangChain chat model for ``model``.
@@ -213,6 +239,9 @@ def build_chat_model(
     ``max_retries`` is LangChain's own transient-error retry, which covers
     rate limits, 5xx and connection failures without retrying a deterministic
     400 -- burning a minute of backoff to fail identically helps nobody.
+
+    ``requests_per_second`` throttles client-side. Worth setting whenever
+    rollouts run concurrently against a single key.
     """
     from langchain.chat_models import init_chat_model
 
@@ -223,6 +252,10 @@ def build_chat_model(
     if sampling_params_deprecated(spec):
         for param in DEPRECATED_SAMPLING_PARAMS:
             kwargs.pop(param, None)
+
+    limiter = build_rate_limiter(requests_per_second)
+    if limiter is not None:
+        kwargs.setdefault("rate_limiter", limiter)
 
     init_kwargs: dict[str, Any] = {"max_retries": max_retries, **kwargs}
     if timeout is not None:
@@ -282,6 +315,59 @@ def invoke_text(model: BaseChatModel, messages: Sequence[BaseMessage], **kwargs:
     except Exception as exc:
         raise LLMError(f"{type(exc).__name__}: {exc}") from exc
     return message_text(response)
+
+
+# --- accounting -------------------------------------------------------------
+
+
+class TokenMeter:
+    """Total token usage for every model call made inside the block.
+
+    Uses LangChain's usage callback rather than summing ``usage_metadata`` at
+    each call site, so it also captures the calls this package makes
+    indirectly -- memory induction, prompt proposals, validation rollouts --
+    which is exactly the spend a per-generation cost figure should include.
+
+    ::
+
+        with TokenMeter() as meter:
+            ...
+        print(meter.total)
+
+    ``total`` stays readable after the block closes, which is the whole point:
+    the generation that spent the tokens reports them one node later.
+    """
+
+    def __init__(self) -> None:
+        self._cm: Any = None
+        self._callback: Any = None
+        self._total = 0
+
+    def __enter__(self) -> TokenMeter:
+        from langchain_core.callbacks import get_usage_metadata_callback
+
+        self._cm = get_usage_metadata_callback()
+        self._callback = self._cm.__enter__()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._total = self._read()
+        if self._cm is not None:
+            self._cm.__exit__(*exc)
+            self._cm = None
+
+    def _read(self) -> int:
+        usage = getattr(self._callback, "usage_metadata", None) or {}
+        return sum(int(counts.get("total_tokens", 0) or 0) for counts in usage.values())
+
+    @property
+    def total(self) -> int:
+        """Tokens counted so far, or in total once the block has closed."""
+        return self._read() if self._cm is not None else self._total
+
+    @property
+    def by_model(self) -> dict[str, Any]:
+        return dict(getattr(self._callback, "usage_metadata", None) or {})
 
 
 # --- test double ------------------------------------------------------------

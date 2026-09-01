@@ -6,6 +6,7 @@ Four verbs, matching the four things you actually do with this system:
     run          one episode, printed step by step
     evolve       the outer loop, streaming a generation table
     ablate       does the memory bank actually help
+    graph        query the causal graph of a run, or print the Cypher to
 
 ``evolve`` streams each generation's line as it completes rather than printing
 a table at the end. A run is minutes to hours of model calls, and a progress
@@ -24,6 +25,8 @@ from meta_evolver.adaptive.controller import AdaptiveControllerConfig
 from meta_evolver.core.evolver import MetaEvolver
 from meta_evolver.core.registry import get_benchmark, list_benchmarks
 from meta_evolver.core.types import GenerationReport
+from meta_evolver.graph_view import SAVED_QUERIES, CausalGraphRecorder
+from meta_evolver.graph_view.recorder import GRAPH_URL_ENV
 from meta_evolver.graphs.evolution import EvolutionConfig
 from meta_evolver.llm.client import DEFAULT_EMBED_MODEL, DEFAULT_MODEL
 from meta_evolver.storage.base import DB_URL_ENV
@@ -120,6 +123,28 @@ def evolve(
             f"Defaults to ${DB_URL_ENV}; without either, a JSONL file is used."
         ),
     ),
+    graph_url: str | None = typer.Option(
+        None,
+        "--graph-url",
+        help=(
+            "Neo4j bolt URL to record the run's causal graph to. "
+            f"Defaults to ${GRAPH_URL_ENV}."
+        ),
+    ),
+    run_id: str | None = typer.Option(
+        None,
+        "--run-id",
+        help=(
+            "Name this run. Reusing a name RESUMES that run from its last "
+            "checkpoint; omit it for a fresh run."
+        ),
+    ),
+    rollouts_per_task: int = typer.Option(
+        1, help="Attempts per task (MaTTS). Above 1, disagreeing attempts feed induction."
+    ),
+    requests_per_second: float | None = typer.Option(
+        None, help="Throttle model calls. Worth setting when rollouts run concurrently."
+    ),
     run_dir: Path | None = typer.Option(None, help="Where telemetry is written."),
     patience: int = typer.Option(6, help="Steps without progress before memory is evicted."),
     retrieval_k: int = typer.Option(4),
@@ -136,6 +161,7 @@ def evolve(
         generations=generations,
         max_steps=max_steps,
         retrieval_k=retrieval_k,
+        rollouts_per_task=rollouts_per_task,
         curriculum=not no_curriculum,
         optimize_prompt=not no_prompt_evolution,
         validate_prompt=not no_validation,
@@ -147,6 +173,9 @@ def evolve(
         embed_dimensions=embed_dimensions,
         memory_path=memory,
         db_url=db_url,
+        graph_url=graph_url,
+        run_id=run_id,
+        requests_per_second=requests_per_second,
         run_dir=run_dir,
         config=config,
         controller_config=AdaptiveControllerConfig(patience=patience),
@@ -156,7 +185,16 @@ def evolve(
         f"[bold]{evolver.benchmark.name}[/bold] via [cyan]{evolver.model_name}[/cyan] "
         f"-- {generations} generations, {len(evolver.benchmark.task_ids('train'))} train tasks"
     )
+    console.print(f"run id:     [cyan]{evolver.run_id}[/cyan]"
+                  + ("  [yellow](resuming)[/yellow]" if evolver.resuming else ""))
     console.print(f"memory:     [cyan]{evolver.bank.backend}[/cyan]")
+    if evolver.recorder.enabled:
+        console.print(
+            f"graph:      [cyan]{evolver.recorder.describe}[/cyan]  "
+            f"watch it at [bold]{evolver.recorder.browser_url()}[/bold]"
+        )
+    elif graph_url or GRAPH_URL_ENV in __import__("os").environ:
+        console.print(f"[yellow]causal graph {evolver.recorder.describe}[/yellow]")
     console.print(
         f"embeddings: [cyan]{embed_model}[/cyan] at {embed_dimensions} dims"
         f"{'' if evolver.embedder.remote_available else ' [yellow](unavailable; using local encoder)[/yellow]'}"
@@ -235,6 +273,73 @@ def ablate(
 
     delta = (with_memory["pass_rate"] - without["pass_rate"]) * 100
     console.print(f"[bold]memory delta: {delta:+.1f} points[/bold]")
+
+
+@app.command()
+def graph(
+    query: str = typer.Argument(
+        "overview", help=f"One of: {', '.join(SAVED_QUERIES)}. Use 'list' to see them all."
+    ),
+    run_id: str = typer.Option(
+        "", "--run-id", help="Which run to query. Not needed for 'list'."
+    ),
+    graph_url: str | None = typer.Option(None, "--graph-url", help="Neo4j bolt URL."),
+    generation: int = typer.Option(0, help="For queries that take one."),
+    cypher: bool = typer.Option(False, "--cypher", help="Print the Cypher instead of running it."),
+) -> None:
+    """Query a run's causal graph -- provenance, regressions, prompt lineage.
+
+    Each saved query answers something the flat telemetry makes you write a
+    join for. ``--cypher`` prints it instead of running it, so it can be
+    pasted into the Neo4j browser and explored as a picture.
+    """
+    if query == "list":
+        table = Table(title="Saved queries")
+        table.add_column("name", style="bold cyan")
+        table.add_column("answers")
+        for name, (description, _) in SAVED_QUERIES.items():
+            table.add_row(name, description)
+        console.print(table)
+        return
+
+    if not run_id:
+        console.print("[red]--run-id is required[/red] (the run's name, printed when it started)")
+        raise typer.Exit(code=1)
+
+    if query not in SAVED_QUERIES:
+        console.print(f"[red]unknown query {query!r}[/red]; try: {', '.join(SAVED_QUERIES)}")
+        raise typer.Exit(code=1)
+
+    description, statement = SAVED_QUERIES[query]
+    console.print(f"[dim]{description}[/dim]")
+
+    if cypher:
+        console.print(f"\n:param run_id => '{run_id}';")
+        if "$generation" in statement:
+            console.print(f":param generation => {generation};")
+        console.print(f"\n{statement}")
+        return
+
+    recorder = CausalGraphRecorder(url=graph_url, run_id=run_id)
+    if not recorder.enabled:
+        console.print(f"[red]causal graph {recorder.describe}[/red]")
+        raise typer.Exit(code=1)
+
+    rows = recorder.query(statement, generation=generation)
+    recorder.close()
+
+    if not rows:
+        console.print("[yellow]no rows -- is the run id right?[/yellow]")
+        return
+
+    table = Table()
+    for column in rows[0]:
+        table.add_column(column)
+    for row in rows[:50]:
+        table.add_row(*[str(row.get(c, ""))[:70] for c in rows[0]])
+    console.print(table)
+    if len(rows) > 50:
+        console.print(f"[dim]... {len(rows) - 50} more rows[/dim]")
 
 
 def main() -> None:

@@ -20,6 +20,7 @@ from meta_evolver.adaptive.controller import (
     AdaptiveExplorationController,
 )
 from meta_evolver.benchmarks.base import BenchmarkAdapter, tool_schema
+from meta_evolver.core.aio import selector_loop_factory
 from meta_evolver.core.env import ActionableEnv, EnvHarness
 from meta_evolver.core.evolver import MetaEvolver
 from meta_evolver.core.registry import (
@@ -73,6 +74,7 @@ __all__ = [
     "list_benchmarks",
     "register_benchmark",
     "run_episode",
+    "selector_loop_factory",
     "tool_call_message",
     "tool_schema",
     "__version__",

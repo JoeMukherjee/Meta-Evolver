@@ -34,6 +34,12 @@ An agent that solves a task and forgets it is a very expensive stateless functio
 | **Prompt** | Failure traces drive OPRO-style rewrites of the system instruction | An unvalidated rewrite each generation is *drift*, not improvement |
 | **Curriculum** | The environment gets harder as the agent gets better | A fixed benchmark stops teaching the moment it is solved |
 
+Set `--rollouts-per-task 3` and each task is attempted several times; attempts
+that *disagree* become contrastive evidence for induction, which is the
+synthesis half of [MaTTS](https://arxiv.org/abs/2509.25140). Scoring switches
+to pass@K and the report says which K it used, because a pass@3 number is not
+comparable with a pass@1 one.
+
 They are coupled on purpose. A harder curriculum produces richer failures → richer failures produce better memories and sharper prompts → better memories and prompts clear the next difficulty. That coupling is the *meta* in Meta-Evolver.
 
 ---
@@ -123,7 +129,54 @@ Two reasons the database is not cosmetic:
 
 **Retrieval stops being O(n).** Embeddings live in a `vector` column with an HNSW cosine index. The query pulls a candidate *pool* rather than exactly `k`, because MMR re-ranks it and diversity needs alternatives to choose between.
 
+**Runs are resumable.** With Postgres configured, LangGraph checkpoints every
+superstep, so a run killed in generation four resumes rather than restarting.
+Resuming is opt-in: `run_id` is unique per run unless you name one, and reusing
+a name is how you ask to continue it.
+
 Memories are scoped by `namespace` (the benchmark name), so one database serves several. That scoping is in the primary key, not just the `WHERE` clause: a memory's id is derived from its text, so two benchmarks that independently learn the same lesson derive the same id — and keyed on the id alone, the second write lands in the first's namespace, where its author cannot read it.
+
+---
+
+## Watching the scaffold evolve
+
+The loop rewrites three pieces of shared state, and the questions you actually
+have about a run are about *provenance*: which episodes produced the memory
+that later carried a task; whether the prompt adopted in generation 3 helped in
+4, or whether a memory pruned at the same time explains it; what changed
+between the generation that passed a task and the one that broke it.
+
+Those are path queries. Recorded to Neo4j they are one Cypher line each — and
+in the browser, a picture that grows while the run happens.
+
+```bash
+docker compose -f docker/docker-compose.yml --profile graph up -d neo4j
+export META_EVOLVER_GRAPH_URL=bolt://neo4j:evolution@localhost:7688
+
+meta-evolver evolve --benchmark devops -g 5     # prints the run id and browser URL
+meta-evolver graph list                          # the saved queries
+meta-evolver graph memory_provenance --run-id run-a1b2c3d4
+meta-evolver graph regressions --run-id run-a1b2c3d4 --cypher   # paste into the browser
+```
+
+Six node labels, and every edge means *caused / produced / was used by*:
+
+```
+(:Run)-[:HAS_GENERATION]->(:Generation)-[:RAN]->(:Episode)-[:ON_TASK]->(:Task)
+(:Generation)-[:USED_PROMPT]->(:Prompt)   (:Generation)-[:AT_LEVEL]->(:CurriculumLevel)
+(:Episode)-[:RETRIEVED]->(:Memory)        ← the memory was in the prompt
+(:Episode)-[:INDUCED]->(:Memory)          ← the episode produced it
+(:Generation)-[:PRUNED]->(:Memory)        (:Prompt)-[:PROPOSED_FROM]->(:Prompt)
+```
+
+`RETRIEVED` and `INDUCED` are the pair that make the bank's history legible:
+follow both directions from a memory and you have where it came from and
+whether it ever helped. Rejected prompt candidates are recorded too — they are
+the evidence that alternatives were tried and measured.
+
+It is observability, never machinery: a Neo4j that is down costs you the
+picture and nothing else. Every write is guarded and the failure count is
+reported.
 
 ---
 
@@ -220,6 +273,8 @@ meta_evolver/
   tools/       routing.py                              ← tool governance
   llm/         client.py, embeddings.py                ← LangChain models
   storage/     jsonl.py, postgres.py, mongo.py       ← pluggable persistence
+               checkpoint.py                          ← resumable runs
+  graph_view/  recorder.py, schema.py                 ← the causal graph
   telemetry/   engine.py
 ```
 
@@ -229,7 +284,7 @@ meta_evolver/
 
 ```bash
 pip install -e ".[dev]"
-pytest -q          # 131 tests, no network; DB tests skip if nothing is listening
+pytest -q          # 143 tests, no network; DB tests skip if nothing is listening
 ```
 
 To exercise the database backends too:
@@ -237,7 +292,8 @@ To exercise the database backends too:
 ```bash
 docker compose -f docker/docker-compose.yml up -d postgres
 docker compose -f docker/docker-compose.yml --profile mongo up -d mongo
-pytest -q          # the storage contract now runs against all three
+docker compose -f docker/docker-compose.yml --profile graph up -d neo4j
+pytest -q          # storage contract across all three, plus the causal graph
 ```
 
 The whole engine runs against `ScriptedChatModel` — a real `BaseChatModel`, so the graphs exercise exactly the path a live model takes (`bind_tools`, `AIMessage.tool_calls`, `ToolMessage` round-tripping) rather than a parallel mock path that can drift from it. The evolution loop, memory curation, curriculum escalation and prompt selection are all covered without an API key.

@@ -33,11 +33,22 @@ The three are coupled: a harder curriculum produces richer failures, which
 produce better memories and sharper prompts, which clear the next difficulty.
 That coupling is the "meta" in meta-evolver.
 
-Rollouts fan out with :class:`~langgraph.types.Send`, so tasks execute
-concurrently and the ``score`` barrier waits for all of them.
+Rollouts fan out with :class:`~langgraph.types.Send` onto async nodes, so a
+generation's episodes genuinely overlap on one event loop rather than queuing
+on a thread each. Wall-clock per generation is roughly the slowest episode,
+not the sum. The ``score`` barrier waits for all of them.
+
+``rollouts_per_task`` is the scaling half of ReasoningBank's MaTTS: attempt
+each task more than once and the attempts that disagree become contrastive
+evidence for induction. It only pays off because the inducer exploits the
+disagreement -- see :mod:`meta_evolver.memory.induction`. Note the honest
+accounting that follows from it: with K rollouts, a task counts as passed if
+*any* attempt passed (pass@K), and the report says which K it used, because a
+pass@3 number is not comparable with a pass@1 one.
 """
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import Sequence
 from typing import Any, Literal
@@ -47,12 +58,14 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
 
 from meta_evolver.core.types import GenerationReport, Trajectory
-from meta_evolver.graphs.episode import run_episode
+from meta_evolver.graphs.episode import arun_episode
 from meta_evolver.graphs.state import EvolutionState, RolloutInput
 from meta_evolver.harness.curriculum import Curriculum
+from meta_evolver.llm.client import TokenMeter
 from meta_evolver.memory.bank import ReasoningMemoryBank
 from meta_evolver.memory.induction import MemoryInducer
 from meta_evolver.prompts.optimizer import PromptOptimizer
+from meta_evolver.storage.checkpoint import thread_id
 
 
 class EvolutionConfig:
@@ -68,6 +81,7 @@ class EvolutionConfig:
         self,
         generations: int = 5,
         tasks_per_generation: int = 0,
+        rollouts_per_task: int = 1,
         validation_fraction: float = 0.34,
         max_steps: int = 15,
         retrieval_k: int = 4,
@@ -86,6 +100,10 @@ class EvolutionConfig:
     ) -> None:
         self.generations = int(generations)
         self.tasks_per_generation = int(tasks_per_generation)
+        self.rollouts_per_task = max(1, int(rollouts_per_task))
+        """Attempts per task per generation (MaTTS). Above 1, a task counts as
+        passed if any attempt passed, and disagreeing attempts become
+        contrastive evidence for memory induction. Costs K times as much."""
         self.validation_fraction = float(validation_fraction)
         self.max_steps = int(max_steps)
         self.retrieval_k = int(retrieval_k)
@@ -111,11 +129,20 @@ def build_evolution_graph(
     config: EvolutionConfig | None = None,
     curriculum: Curriculum | None = None,
     on_report: Any = None,
+    run_id: str = "run",
+
+    recorder: Any = None,
 ):
     """Compile the evolution graph.
 
     ``on_report`` is called with each :class:`GenerationReport` as it is
     produced, so a CLI can stream progress without waiting for the whole run.
+
+    ``recorder`` is an optional
+    :class:`~meta_evolver.graph_view.recorder.CausalGraphRecorder`. It is
+    written to as each generation completes rather than at the end, so the
+    graph is watchable while the run happens -- and it can never fail a run:
+    every write there is guarded.
     """
     cfg = config or EvolutionConfig()
     curr = curriculum or Curriculum()
@@ -125,7 +152,7 @@ def build_evolution_graph(
 
     # -- nodes -------------------------------------------------------------
 
-    def sample_tasks(state: EvolutionState) -> dict[str, Any]:
+    async def sample_tasks(state: EvolutionState) -> dict[str, Any]:
         """Pick this generation's train and validation tasks.
 
         The split is by *task*, not by episode, and validation tasks never
@@ -158,44 +185,84 @@ def build_evolution_graph(
             "prompt_template": state.get("prompt_template", ""),
             "prompt_version": state.get("prompt_version", "base"),
         }
-        return [Send("rollout", {**payload, "task_id": task_id}) for task_id in task_ids]
+        # One branch per (task, attempt). Each is an independent Send, so K
+        # rollouts of one task overlap with every other task's rather than
+        # running as an inner loop inside a single branch.
+        return [
+            Send("rollout", {**payload, "task_id": task_id, "rollout_index": attempt})
+            for task_id in task_ids
+            for attempt in range(cfg.rollouts_per_task)
+        ]
 
-    def rollout(state: RolloutInput) -> dict[str, Any]:
-        """Run a single task. Returns exactly one trajectory."""
-        task_id = state["task_id"]
-        level = state.get("curriculum_level", 0.0)
-        env = benchmark.make_env(task_id, curriculum_level=level, seed=cfg.seed)
-        env = curr.wrap(env, level=level, seed=cfg.seed)
+    async def rollout(state: RolloutInput) -> dict[str, Any]:
+        """Run a single attempt at a single task. Returns one trajectory."""
+        generation = state.get("generation", 0)
+        trajectory = await _episode(
+            task_id=state["task_id"],
+            generation=generation,
+            level=state.get("curriculum_level", 0.0),
+            prompt=state.get("prompt_template", ""),
+            version=state.get("prompt_version", "base"),
+            rollout_index=int(state.get("rollout_index", 0)),
+            phase="train",
+        )
+        return {"trajectories": [trajectory]}
+
+    async def _episode(
+        task_id: str,
+        generation: int,
+        level: float,
+        prompt: str,
+        version: str,
+        rollout_index: int = 0,
+        phase: str = "train",
+    ) -> Trajectory:
+        """Build the env stack, run one episode, and always release the env.
+
+        Seeded by attempt so K rollouts of one task meet different perturbation
+        draws -- identical harness seeds would make repeated attempts
+        near-duplicates, and MaTTS needs them to be able to diverge.
+        """
+        seed = cfg.seed + rollout_index * 7919
+        env = benchmark.make_env(task_id, curriculum_level=level, seed=seed)
+        env = curr.wrap(env, level=level, seed=seed)
         try:
-            trajectory = run_episode(
+            return await arun_episode(
                 episode_graph,
                 env=env,
                 task_id=task_id,
                 benchmark=benchmark.name,
                 instruction=benchmark.instruction_for(task_id),
-                prompt_template=state.get("prompt_template", ""),
-                prompt_version=state.get("prompt_version", "base"),
+                prompt_template=prompt,
+                prompt_version=version,
                 max_steps=cfg.max_steps,
-                generation=state.get("generation", 0),
+                generation=generation,
+                rollout_index=rollout_index,
+                thread_id=thread_id(run_id, phase, generation, version, task_id, rollout_index),
             )
         finally:
             env.close()
-        return {"trajectories": [trajectory]}
 
-    def score(state: EvolutionState) -> dict[str, Any]:
+    async def score(state: EvolutionState) -> dict[str, Any]:
         """Barrier: all rollouts are in. Nothing to compute yet -- the report
         is assembled at ``checkpoint``, after the learners have run and can
         report what they changed."""
         return {}
 
-    def induce(state: EvolutionState) -> dict[str, Any]:
+    async def induce(state: EvolutionState) -> dict[str, Any]:
         """Distil this generation's episodes into candidate memories."""
         if not cfg.induce_memories:
-            return {"induced": []}
-        current = [t for t in state.get("trajectories", []) if t.generation == state.get("generation", 0)]
-        return {"induced": inducer.induce(current, benchmark=benchmark.name)}
+            return {"induced": [], "induction_tokens": 0}
+        current = [
+            t for t in state.get("trajectories", []) if t.generation == state.get("generation", 0)
+        ]
+        with TokenMeter() as meter:
+            induced = inducer.induce(current, benchmark=benchmark.name)
+        if recorder is not None and induced:
+            recorder.record_memories(induced, generation=state.get("generation", 0))
+        return {"induced": induced, "induction_tokens": meter.total}
 
-    def credit(state: EvolutionState) -> dict[str, Any]:
+    async def credit(state: EvolutionState) -> dict[str, Any]:
         """Charge each retrieved memory for the episode it took part in.
 
         Episodes that errored are excluded. Charging a memory for a rate-limit
@@ -211,7 +278,7 @@ def build_evolution_graph(
         bank.credit_assign(pairs, generation=generation)
         return {}
 
-    def prune(state: EvolutionState) -> dict[str, Any]:
+    async def prune(state: EvolutionState) -> dict[str, Any]:
         """Add the new memories, then evict the proven-bad ones.
 
         Order matters: adding first lets a new item merge into an existing
@@ -224,6 +291,8 @@ def build_evolution_graph(
         dropped = bank.prune(
             min_uses=cfg.prune_min_uses, min_utility=cfg.prune_min_utility
         )
+        if recorder is not None and dropped:
+            recorder.record_pruned(dropped, generation=generation)
         if bank.path is not None:
             bank.save()
         return {
@@ -233,20 +302,35 @@ def build_evolution_graph(
             "memories_pruned": len(dropped),
         }
 
-    def optimize_prompt(state: EvolutionState) -> dict[str, Any]:
+    async def optimize_prompt(state: EvolutionState) -> dict[str, Any]:
         """Propose prompt candidates and adopt one only if it validates."""
         if not cfg.optimize_prompt:
-            return {}
+            return {"optimization_tokens": 0}
         generation = state.get("generation", 0)
         current = [t for t in state.get("trajectories", []) if t.generation == generation]
         incumbent = state.get("prompt_template", "")
 
-        candidates = optimizer.propose(
-            incumbent, current, generation=generation, benchmark=benchmark.name
-        )
-        if not candidates:
-            return {}
+        # Metered around proposals and validation together: validation
+        # rollouts are real spend attributable to prompt optimization, and
+        # attributing them to the generation's rollouts would understate what
+        # searching for a better prompt actually costs.
+        meter = TokenMeter().__enter__()
+        try:
+            candidates = optimizer.propose(
+                incumbent, current, generation=generation, benchmark=benchmark.name
+            )
+            if not candidates:
+                return {"optimization_tokens": 0}
+            result = await _select_prompt(state, incumbent, candidates)
+        finally:
+            meter.__exit__(None, None, None)
+        result["optimization_tokens"] = meter.total
+        return result
 
+    async def _select_prompt(
+        state: EvolutionState, incumbent: str, candidates: list
+    ) -> dict[str, Any]:
+        """Measure each candidate against the incumbent and pick a winner."""
         val_ids = state.get("validation_task_ids") or []
         if not cfg.validate_prompt or not val_ids:
             # No held-out split available: adopt the first proposal, and say so
@@ -259,12 +343,29 @@ def build_evolution_graph(
                 "prompt_note": "adopted unvalidated (no validation split)",
             }
 
-        baseline = _validate(state, incumbent, state.get("prompt_version", "base"), val_ids)
-        best_text, best_version, best_score = incumbent, state.get("prompt_version", "base"), baseline
-        for cand in candidates:
-            cand.score = _validate(state, cand.text, cand.version, val_ids)
-            if cand.score > best_score + cfg.prompt_adoption_margin:
-                best_text, best_version, best_score = cand.text, cand.version, cand.score
+        incumbent_version = state.get("prompt_version", "base")
+        # The incumbent and every candidate are measured on the same held-out
+        # tasks, concurrently: they are independent, and running them in
+        # sequence would make validation the slowest part of a generation.
+        scores = await asyncio.gather(
+            _validate(state, incumbent, incumbent_version, val_ids),
+            *[_validate(state, c.text, c.version, val_ids) for c in candidates],
+        )
+        baseline, candidate_scores = scores[0], scores[1:]
+
+        best_text, best_version, best_score = incumbent, incumbent_version, baseline
+        for cand, score in zip(candidates, candidate_scores, strict=True):
+            cand.score = score
+            if score > best_score + cfg.prompt_adoption_margin:
+                best_text, best_version, best_score = cand.text, cand.version, score
+
+        if recorder is not None:
+            # Rejected candidates are recorded too: they are the evidence that
+            # alternatives were tried and measured, which a graph showing only
+            # the adopted lineage would lose.
+            recorder.record_prompt_candidates(
+                candidates, generation=state.get("generation", 0), adopted_version=best_version
+            )
 
         changed = best_version != state.get("prompt_version", "base")
         challenger = max((c.score or 0.0) for c in candidates)
@@ -279,36 +380,32 @@ def build_evolution_graph(
             ),
         }
 
-    def _validate(
+    async def _validate(
         state: EvolutionState, prompt: str, version: str, task_ids: Sequence[str]
     ) -> float:
-        """Pass rate of ``prompt`` on the held-out tasks."""
-        wins = usable = 0
-        for task_id in task_ids:
-            env = benchmark.make_env(
-                task_id, curriculum_level=state.get("curriculum_level", 0.0), seed=cfg.seed
-            )
-            env = curr.wrap(env, level=state.get("curriculum_level", 0.0), seed=cfg.seed)
-            try:
-                t = run_episode(
-                    episode_graph,
-                    env=env,
-                    task_id=task_id,
-                    benchmark=benchmark.name,
-                    instruction=benchmark.instruction_for(task_id),
-                    prompt_template=prompt,
-                    prompt_version=version,
-                    max_steps=cfg.max_steps,
-                    generation=state.get("generation", 0),
-                )
-            finally:
-                env.close()
-            if t.usable:
-                usable += 1
-                wins += int(t.success)
-        return wins / usable if usable else 0.0
+        """Pass rate of ``prompt`` on the held-out tasks.
 
-    def adapt_curriculum(state: EvolutionState) -> dict[str, Any]:
+        Validation is single-rollout regardless of ``rollouts_per_task``: it
+        compares prompts, and pass@K would blur the comparison it exists to
+        make while multiplying its cost.
+        """
+        results = await asyncio.gather(
+            *[
+                _episode(
+                    task_id=task_id,
+                    generation=state.get("generation", 0),
+                    level=state.get("curriculum_level", 0.0),
+                    prompt=prompt,
+                    version=version,
+                    phase=f"validate-{version}",
+                )
+                for task_id in task_ids
+            ]
+        )
+        usable = [t for t in results if t.usable]
+        return sum(t.success for t in usable) / len(usable) if usable else 0.0
+
+    async def adapt_curriculum(state: EvolutionState) -> dict[str, Any]:
         """Raise or lower environment difficulty based on this generation."""
         if not cfg.curriculum:
             return {}
@@ -322,24 +419,33 @@ def build_evolution_graph(
         )
         return {"curriculum_level": level}
 
-    def checkpoint(state: EvolutionState) -> dict[str, Any]:
+    async def checkpoint(state: EvolutionState) -> dict[str, Any]:
         """Emit this generation's report and decide whether to continue."""
         generation = state.get("generation", 0)
         trajectories = state.get("trajectories", [])
         stats = _stats(trajectories, generation)
         started = clock.get(generation, time.time())
 
-        outcomes = {
-            t.task_id: t.success
-            for t in trajectories
-            if t.generation == generation and t.usable
-        }
+        outcomes: dict[str, bool] = {}
+        for t in trajectories:
+            if t.generation == generation and t.usable:
+                # pass@K: a task regressed only if every attempt failed.
+                outcomes[t.task_id] = outcomes.get(t.task_id, False) or t.success
         previous = state.get("last_outcomes") or {}
         regressions = sum(
             1 for tid, ok in outcomes.items() if previous.get(tid) is True and not ok
         )
         recoveries = sum(
             1 for tid, ok in outcomes.items() if previous.get(tid) is False and ok
+        )
+
+        # Rollouts report their own usage on the trajectory; the two spending
+        # nodes report theirs directly. Together that is every model call the
+        # generation made.
+        tokens = (
+            sum(t.tokens for t in trajectories if t.generation == generation)
+            + int(state.get("induction_tokens", 0) or 0)
+            + int(state.get("optimization_tokens", 0) or 0)
         )
 
         notes: list[str] = []
@@ -357,6 +463,8 @@ def build_evolution_graph(
             n_errors=stats["n_errors"],
             regressions=regressions,
             recoveries=recoveries,
+            tokens=tokens,
+            rollouts_per_task=cfg.rollouts_per_task,
             pass_rate=stats["pass_rate"],
             avg_steps=stats["avg_steps"],
             avg_score=stats["avg_score"],
@@ -370,6 +478,13 @@ def build_evolution_graph(
             duration_s=time.time() - started,
             notes=notes,
         )
+        if recorder is not None:
+            recorder.record_generation(
+                report,
+                trajectories,
+                prompt_text=state.get("prompt_template", ""),
+                curriculum_name=curr.describe(report.curriculum_level),
+            )
         if on_report is not None:
             on_report(report)
 
@@ -398,6 +513,8 @@ def build_evolution_graph(
             "memories_pruned": 0,
             "validation_pass_rate": None,
             "prompt_note": "",
+            "induction_tokens": 0,
+            "optimization_tokens": 0,
         }
 
     def route_after_checkpoint(state: EvolutionState) -> Literal["sample_tasks", "__end__"]:
@@ -442,28 +559,42 @@ def build_evolution_graph(
 
 
 def _stats(trajectories: Sequence[Trajectory], generation: int) -> dict[str, Any]:
-    """Aggregate one generation's episodes.
+    """Aggregate one generation's episodes, per task rather than per episode.
 
-    Errored episodes are counted and reported but excluded from the rates.
-    A pass rate diluted by API failures is not a measurement of the agent.
+    Two things this gets right that a naive mean does not:
+
+    * Errored episodes are counted and reported but excluded from the rates.
+      A pass rate diluted by API failures is not a measurement of the agent.
+    * With K rollouts per task, a task passes if *any* attempt passed (pass@K)
+      and is counted once. Averaging over episodes instead would let a task
+      attempted three times outvote one attempted once, so the headline number
+      would drift with the rollout budget rather than with the agent.
     """
     current = [t for t in trajectories if t.generation == generation]
     usable = [t for t in current if t.usable]
     n_errors = len(current) - len(usable)
     if not usable:
         return {
-            "n": len(current),
+            "n": len({t.task_id for t in current}),
             "n_errors": n_errors,
             "pass_rate": 0.0,
             "avg_steps": 0.0,
             "avg_score": 0.0,
         }
+
+    by_task: dict[str, list[Trajectory]] = {}
+    for trajectory in usable:
+        by_task.setdefault(trajectory.task_id, []).append(trajectory)
+
+    passed = sum(1 for attempts in by_task.values() if any(t.success for t in attempts))
+    # Steps and score describe the attempt that counted: the best one.
+    best = [max(attempts, key=lambda t: (t.success, t.score, -t.n_steps)) for attempts in by_task.values()]
     return {
-        "n": len(current),
+        "n": len(by_task),
         "n_errors": n_errors,
-        "pass_rate": sum(t.success for t in usable) / len(usable),
-        "avg_steps": sum(t.n_steps for t in usable) / len(usable),
-        "avg_score": sum(t.score for t in usable) / len(usable),
+        "pass_rate": passed / len(by_task),
+        "avg_steps": sum(t.n_steps for t in best) / len(best),
+        "avg_score": sum(t.score for t in best) / len(best),
     }
 
 

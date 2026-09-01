@@ -67,6 +67,38 @@ services:
       start_period: 10s
     restart: unless-stopped
 
+  neo4j:
+    # The causal graph of a run: generations, prompts, memories, episodes and
+    # the edges between them. In the `graph` profile because it is an
+    # observability surface, not something a run needs to work.
+    #
+    #   docker compose -f docker/docker-compose.yml --profile graph up -d
+    #   export META_EVOLVER_GRAPH_URL=bolt://neo4j:evolution@localhost:7688
+    #   open http://localhost:7475      (user neo4j, password evolution)
+    # Calendar-versioned since 2025; pinned to a minor rather than a
+    # floating tag so a `compose pull` cannot change the server under a run.
+    image: neo4j:2026.07-community
+    container_name: meta-evolver-neo4j
+    profiles: ["graph"]
+    environment:
+      NEO4J_AUTH: neo4j/evolution
+      # 8 chars is the server minimum; the compose default above satisfies it.
+      NEO4J_server_memory_heap_max__size: 512M
+      NEO4J_server_memory_pagecache_size: 256M
+    ports:
+      - "7475:7474"   # Browser UI
+      - "7688:7687"   # Bolt
+    volumes:
+      - neo4j-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 >/dev/null || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 20s
+    restart: unless-stopped
+
 volumes:
   postgres-data:
   mongo-data:
+  neo4j-data:

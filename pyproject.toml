@@ -19,6 +19,7 @@ keywords = [
     "prompt-optimization",
     "curriculum-learning",
     "pgvector",
+    "neo4j",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -51,6 +52,9 @@ anthropic = ["langchain-anthropic>=0.3"]
 # past what is sensible to score in Python (server-side ANN).
 postgres = ["psycopg[binary,pool]>=3.1", "pgvector>=0.2.5"]
 mongo = ["pymongo>=4.6"]
+# The causal-graph view: a run's provenance recorded to Neo4j and browsable
+# live. Purely observability -- nothing in the engine depends on it.
+graph = ["neo4j>=6.0"]
 all = [
     "langchain-google-genai>=2.0",
     "langchain-openai>=0.2",
@@ -58,6 +62,7 @@ all = [
     "psycopg[binary,pool]>=3.1",
     "pgvector>=0.2.5",
     "pymongo>=4.6",
+    "neo4j>=6.0",
 ]
 dev = ["pytest>=7.0", "pytest-cov>=4.0", "ruff>=0.6"]
 
