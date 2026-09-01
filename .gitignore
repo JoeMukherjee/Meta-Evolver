@@ -1,25 +1,26 @@
 # Python
 __pycache__/
 *.py[cod]
-*.so
+*.egg-info/
 build/
 dist/
-*.egg-info/
 .eggs/
 
-# Virtual Environments
+# Environments
 .env
-.venv
-env/
+.venv/
 venv/
+env/
 
-# Testing & Coverage
+# Testing
 .pytest_cache/
+.ruff_cache/
 .coverage
 htmlcov/
 
-# Experiments & Data
+# Run artifacts
 runs/
-logs/
 *.log
-*.sqlite
+memories.jsonl
+.pytest_cache/
+.ruff_cache/
