@@ -1,0 +1,72 @@
+# Local backing services for Meta-Evolver.
+#
+#   docker compose -f docker/docker-compose.yml up -d postgres
+#   export META_EVOLVER_DB_URL=postgresql://meta:meta@localhost:5433/meta_evolver
+#   meta-evolver evolve --benchmark devops
+#
+# Mongo is in the `mongo` profile and stays down unless asked for, because
+# Postgres is the backend that does vector search and most runs need only it:
+#
+#   docker compose -f docker/docker-compose.yml --profile mongo up -d
+#   export META_EVOLVER_DB_URL='mongodb://meta:meta@localhost:27018/meta_evolver?authSource=admin'
+#
+# Note the authSource: the root user below is created in `admin`, so a URL
+# naming only the application database authenticates against the wrong one and
+# fails with a bare "Authentication failed".
+#
+# Ports are deliberately non-default (5433, 27018) so this cannot collide with
+# a Postgres or Mongo you already run.
+
+name: meta-evolver
+
+services:
+  postgres:
+    # pgvector ships the extension prebuilt; plain `postgres` does not, and
+    # `CREATE EXTENSION vector` would fail on first connect.
+    image: pgvector/pgvector:pg17
+    container_name: meta-evolver-postgres
+    environment:
+      POSTGRES_USER: meta
+      POSTGRES_PASSWORD: meta
+      POSTGRES_DB: meta_evolver
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      # Runs once, on an empty data directory. The application also creates
+      # its schema on connect, so this matters mainly for a role without DDL
+      # rights (see PostgresMemoryStore(create_schema=False)).
+      - ./init.sql:/docker-entrypoint-initdb.d/10-init.sql:ro
+    healthcheck:
+      # Wait for readiness rather than sleeping: the first connect otherwise
+      # races the server's own startup and fails intermittently.
+      test: ["CMD-SHELL", "pg_isready -U meta -d meta_evolver"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    restart: unless-stopped
+
+  mongo:
+    image: mongo:8
+    container_name: meta-evolver-mongo
+    profiles: ["mongo"]
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: meta
+      MONGO_INITDB_ROOT_PASSWORD: meta
+      MONGO_INITDB_DATABASE: meta_evolver
+    ports:
+      - "27018:27017"
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  mongo-data:

@@ -17,6 +17,14 @@ renormalize it or silently start comparing by magnitude as well as direction.
 This module normalizes on arrival anyway, so a bank stays coherent across a
 model switch -- but with ``-2`` that guard is a belt, not the braces.
 
+**Asymmetry.** A stored memory and a search query are different kinds of
+text, and Gemini exposes that: ``RETRIEVAL_DOCUMENT`` and ``RETRIEVAL_QUERY``
+project into the same space but from different sides, which measurably beats
+embedding both identically. :class:`Embedder` therefore has two entry points --
+:meth:`~Embedder.embed_documents` for what goes into the bank and
+:meth:`~Embedder.embed_query` for what searches it -- and the cache is keyed by
+both text *and* kind, because the same string legitimately has two vectors.
+
 **Fallback.** Retrieval must keep working with no embedding API -- offline, in
 CI, when a provider is down -- so this degrades to a hashed bag-of-words
 encoder rather than failing.
@@ -49,6 +57,13 @@ _STOPWORDS = frozenset(
 
 def _tokens(text: str) -> list[str]:
     return [t for t in _TOKEN_RE.findall(text.lower()) if t not in _STOPWORDS and len(t) > 1]
+
+
+def _default_width() -> int:
+    """The configured embedding width, imported lazily to avoid a cycle."""
+    from meta_evolver.llm.client import DEFAULT_EMBED_DIMENSIONS
+
+    return DEFAULT_EMBED_DIMENSIONS or FALLBACK_DIM
 
 
 def l2_normalize(vec: Sequence[float]) -> list[float]:
@@ -130,31 +145,58 @@ class Embedder:
         embeddings: Any | None = None,
         model: str | None = None,
         dimensions: int | None = None,
-        dim: int = FALLBACK_DIM,
+        dim: int | None = None,
     ) -> None:
         if embeddings is None and model is not None:
             embeddings = build_embeddings(model, dimensions=dimensions)
         self.embeddings = embeddings
-        self.dim = dim
-        self._cache: dict[str, list[float]] = {}
+        # The fallback encoder emits the same width as the remote model by
+        # default. A narrower fallback would produce vectors that no vector
+        # index can hold, so a provider outage mid-run would quietly leave
+        # part of the bank unsearchable rather than merely less accurate.
+        self.dim = int(dim if dim is not None else (dimensions or _default_width()))
+        self._cache: dict[tuple[str, str], list[float]] = {}
         self.remote_available = embeddings is not None
         self.n_remote = 0
         self.n_fallback = 0
 
+    def embed_documents(self, texts: Sequence[str]) -> list[list[float]]:
+        """Embed text that will be *stored* and later searched over."""
+        return self._embed(list(texts), kind="document")
+
+    def embed_query(self, text: str) -> list[float]:
+        """Embed text that is *searching* the bank."""
+        return self._embed([text], kind="query")[0]
+
+    # `embed` / `embed_one` keep the document side, which is what every
+    # existing caller meant by them.
     def embed(self, texts: Sequence[str]) -> list[list[float]]:
-        texts = list(texts)
-        missing = [t for t in texts if t not in self._cache]
+        return self.embed_documents(texts)
+
+    def embed_one(self, text: str) -> list[float]:
+        return self.embed_documents([text])[0]
+
+    def _embed(self, texts: list[str], kind: str) -> list[list[float]]:
+        keys = [(kind, t) for t in texts]
+        missing = [t for key, t in zip(keys, texts, strict=True) if key not in self._cache]
 
         if missing and self.remote_available and self.embeddings is not None:
             try:
-                vectors = self.embeddings.embed_documents(missing)
+                if kind == "query":
+                    # `embed_query` carries RETRIEVAL_QUERY; `embed_documents`
+                    # carries RETRIEVAL_DOCUMENT. Calling the document method
+                    # for a query -- as this did before -- silently discards
+                    # the asymmetry the model was trained to exploit.
+                    vectors = [self.embeddings.embed_query(t) for t in missing]
+                else:
+                    vectors = self.embeddings.embed_documents(missing)
             except Exception:
                 vectors = None
             if vectors and len(vectors) == len(missing):
                 for text, vec in zip(missing, vectors, strict=True):
                     # Normalized on arrival so the bank stays coherent even
                     # across an embedding-model switch. See the module note.
-                    self._cache[text] = l2_normalize(vec)
+                    self._cache[(kind, text)] = l2_normalize(vec)
                 self.n_remote += len(missing)
                 missing = []
             else:
@@ -164,13 +206,12 @@ class Embedder:
                 self.remote_available = False
 
         for text in missing:
-            self._cache[text] = hashed_embedding(text, self.dim)
+            # The local encoder has no notion of task type, so both kinds map
+            # to the same vector -- correct, since it is a symmetric encoder.
+            self._cache[(kind, text)] = hashed_embedding(text, self.dim)
             self.n_fallback += 1
 
-        return [self._cache[t] for t in texts]
-
-    def embed_one(self, text: str) -> list[float]:
-        return self.embed([text])[0]
+        return [self._cache[key] for key in keys]
 
 
 def cosine(a: Sequence[float], b: Sequence[float]) -> float:
