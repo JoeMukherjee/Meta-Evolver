@@ -46,6 +46,11 @@ They are coupled on purpose. A harder curriculum produces richer failures → ri
 
 ## Two graphs
 
+<p align="center">
+  <img src="./docs/figures/fig1_system_architecture.png" width="95%" alt="Meta-Evolver Dual-Graph System Architecture" />
+</p>
+<p align="center"><em>Figure 1: Dual-Graph Self-Improvement Architecture.</em> The Outer Evolution Graph fans out concurrent rollouts across tasks ($K=3$), collects traces at a scoring barrier, induces contrastive strategies into the Reasoning Bank, updates Bayesian Beta crediting, optimizes prompt components via Pareto frontier search, and escalates environment curriculum difficulty ($0.20 \to 0.80$). The Inner Episode Graph drives the agent rollout with in-flight semantic assertions (`assert_retry`), dynamic prompt rendering, and adaptive stagnation eviction.</p>
+
 ### The episode graph — one rollout
 
 ```text
@@ -77,6 +82,11 @@ Rollouts fan out concurrently with LangGraph's `Send`; `score` is the barrier th
 
 ## What makes the loop actually converge
 
+<p align="center">
+  <img src="./docs/figures/fig3_evolution_crediting.png" width="95%" alt="Multi-Generation Progression and Bayesian Crediting" />
+</p>
+<p align="center"><em>Figure 2: Empirical Self-Evolution & Bayesian Crediting Dynamics.</em> (a) Multi-generation evolution maintains a 100% pass rate under escalating curriculum difficulty (faults, noise, verification gates). (b) Posterior Beta distributions $\mathrm{Beta}(\mathrm{wins}+1, \mathrm{uses}-\mathrm{wins}+1)$ for active high-utility strategies ($\mathbb{E}[U]=0.91$) versus pruned counter-productive strategies ($\mathbb{E}[U]=0.25$, pruned below $U=0.34$).</p>
+
 Most of the design here is about *not* fooling yourself. Five decisions do the work:
 
 **Memories are credited, not just collected.** Every episode records which memory ids were in its prompt. After the generation, each gets `uses += 1` and `wins += 1` if the episode succeeded — a Beta posterior over "episodes citing this succeed". Retrieval ranks by similarity *modulated by* that utility, so a memory that keeps appearing alongside failures loses its slot before it is ever deleted. `prune` then removes items that have had a fair trial and lost.
@@ -92,6 +102,11 @@ Most of the design here is about *not* fooling yourself. Five decisions do the w
 ---
 
 ## Retrieved memory as a trap, and the fix
+
+<p align="center">
+  <img src="./docs/figures/fig2_ood_generalization.png" width="95%" alt="ALFWorld Out-Of-Distribution Generalization" />
+</p>
+<p align="center"><em>Figure 3: Out-Of-Distribution (OOD) Retrieval Trap Mitigation on ALFWorld.</em> (a) OOD pass rate jumps from 0.0% to 100.0% under our adaptive controller. (b) Interaction steps drop from 50 (budget exhausted) to 32 (-36% steps, 44.6% faster). (c1) Static retrieval gets trapped in endless loops checking countertops. (c2) Adaptive controller evicts the prior at step 6 and systematically explores unvisited drawers/cabinets to find the target.</p>
 
 Retrieval-augmented agents have a specific, reproducible failure mode on out-of-distribution tasks. The bank returns the nearest strategy; the strategy does not apply; the agent follows it anyway, because a confident instruction in the system prompt outweighs a few discouraging observations. It then loops — re-checking the places the memory named, growing more certain with each empty result. **More retrieval makes this worse**: the same wrong prior is re-injected every turn.
 
@@ -231,6 +246,11 @@ See [`examples/custom_benchmark.py`](examples/custom_benchmark.py) for the whole
 ---
 
 ## Advanced Scaffolding Subsystems (API LLM / Frozen-Weight Optimization)
+
+<p align="center">
+  <img src="./docs/figures/fig4_declarative_scaffolding.png" width="95%" alt="5 Declarative Scaffolding Subsystems" />
+</p>
+<p align="center"><em>Figure 4: Five Declarative Scaffolding Subsystems for API-Only LLMs.</em> Meta-Evolver optimizes the execution harness rather than model weights via: (1) <code>ScaffoldAssert</code> in-flight constraint validation and zero-penalty backtracking, (2) <code>GEPAPromptOptimizer</code> modular Pareto-frontier mutation and crossover, (3) <code>ScaffoldRLM</code> sandboxed variable REPL with recursive sub-LLM calls, (4) <code>FlexScaffold</code> executable code evolution, and (5) <code>TelemetryTracer</code> hierarchical span tracing.</p>
 
 Meta-Evolver operates entirely at the **scaffolding layer**, enabling continuous self-improvement across API-only LLMs without modifying foundation model weights:
 
