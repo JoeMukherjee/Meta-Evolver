@@ -6,6 +6,11 @@ What Meta-Evolver borrows, what it adds, and what it deliberately leaves out.
 
 ## The frame
 
+<p align="center">
+  <img src="./figures/fig1_system_architecture.png" width="95%" alt="Meta-Evolver Dual-Graph Architecture" />
+</p>
+<p align="center"><em>Figure 1: Dual-Graph Self-Improvement Architecture.</em> The system decouples the Outer Evolution Graph (multi-task fan-out, contrastive memory induction, Bayesian Beta crediting, and curriculum escalation) from the Inner Episode Graph (stateful agent execution, in-flight semantic assertions, and adaptive stagnation eviction).</p>
+
 [**Self-Improvements in Modern Agentic Systems: A Survey**](https://arxiv.org/abs/2607.13104) — Ren, Guo, Rong, Chen, Wang, Li, Yang, Zhuge, Schmidhuber et al. (Jilin University / KAUST / IDSIA, July 2026)
 
 The survey formalises a modern agent as `A = (θ, Σ)`: foundation-model parameters `θ` plus an operational **scaffold** `Σ = (prompts, memory, tools, control logic)`. Self-improvement is a self-induced update operator applied to one or the other. That split is the cleanest available account of what this project is:
@@ -67,6 +72,11 @@ This closes the loop the survey calls signal-driven memory processing (Create/Re
 
 ## The OOD failure mode
 
+<p align="center">
+  <img src="./figures/fig2_ood_generalization.png" width="95%" alt="ALFWorld OOD Trajectory and Benchmark Breakthrough" />
+</p>
+<p align="center"><em>Figure 2: Empirical OOD Retrieval Trap Mitigation on ALFWorld.</em> (a) Jump from 0.0% to 100.0% task success rate under out-of-distribution item displacement. (b) 36% step reduction (50 timeout steps vs. 32 efficient steps). (c1-c2) Spatial trajectory comparison demonstrating loop-eviction at Step 6 and systematic drawer/cabinet search.</p>
+
 Related work converged on the same problem from several directions:
 
 - [**SkillOS: Learning Skill Curation for Self-Evolving Agents**](https://arxiv.org/abs/2605.06614) (May 2026) — curation, not accumulation, is the bottleneck.
@@ -103,6 +113,11 @@ So [`optimizer.py`](../meta_evolver/prompts/optimizer.py) proposes several candi
 
 ## Curriculum
 
+<p align="center">
+  <img src="./figures/fig3_evolution_crediting.png" width="95%" alt="Curriculum Escalation and Bayesian Utility Dynamics" />
+</p>
+<p align="center"><em>Figure 3: Multi-Generation Curriculum Escalation & Bayesian Memory Crediting.</em> Left: Generational pass rate maintaining 100% resolution under progressively harder fault injection, verification gates, and distractor noise. Right: Bayesian Beta posterior density curves showing high-utility reinforcement ($\mathbb{E}[U]=0.91$) vs. autonomous pruning threshold ($\mathbb{E}[U]=0.25 < \tau=0.34$).</p>
+
 Not a category in the survey's taxonomy — its scope is the agent, not the environment — but it addresses a problem the survey names directly in its discussion of evaluation: measuring *continuous* improvement.
 
 A fixed benchmark stops teaching the moment it is solved. Every subsequent generation runs the same tasks, produces the same successes, and the memory bank and prompt optimizer have nothing left to learn from. The curve flattens, and it is easy to mistake that plateau for convergence.
@@ -119,6 +134,11 @@ This is closest in spirit to EnvHarness-style environment mutation: the `Rules` 
 ---
 
 ## Declarative Scaffolding & LM Compiler Grounding
+
+<p align="center">
+  <img src="./figures/fig4_declarative_scaffolding.png" width="95%" alt="Declarative Scaffolding Architecture" />
+</p>
+<p align="center"><em>Figure 4: Five Declarative Scaffolding Subsystems.</em> Adapting DSPy compiler mechanisms for API LLMs without parameter updates: (1) <code>ScaffoldAssert</code> in-flight constraint validation & retry, (2) <code>GEPAPromptOptimizer</code> modular Pareto-frontier mutation/crossover, (3) <code>ScaffoldRLM</code> sandboxed variable REPL space, (4) <code>FlexScaffold</code> executable code evolution, and (5) <code>TelemetryTracer</code> OpenTelemetry/MLflow span tracing.</p>
 
 [**DSPy: Compiling Declarative Language Model Calls into State-of-the-Art Pipelines**](https://arxiv.org/abs/2310.03714) — Khattab et al. (Stanford NLP, 2023/2024)
 
