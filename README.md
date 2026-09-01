@@ -29,7 +29,7 @@ export META_EVOLVER_DB_URL=postgresql://meta:meta@localhost:5433/meta_evolver
 An agent that solves a task and forgets it is a very expensive stateless function. Three things have to change between one attempt and the next for the agent to actually improve, and Meta-Evolver evolves all three, in one loop:
 
 | Channel | What changes | Why it alone is not enough |
-|---|---|---|
+| --- | --- | --- |
 | **Memory** | Failures and successes distil into reusable strategies | A bank that only grows fills its retrieval slots with paraphrases and never unlearns a bad lesson |
 | **Prompt** | Failure traces drive OPRO-style rewrites of the system instruction | An unvalidated rewrite each generation is *drift*, not improvement |
 | **Curriculum** | The environment gets harder as the agent gets better | A fixed benchmark stops teaching the moment it is solved |
@@ -48,20 +48,21 @@ They are coupled on purpose. A harder curriculum produces richer failures → ri
 
 ### The episode graph — one rollout
 
-```
+```text
   START → prepare → think → route
-                      ↑       ├── (prose, no tool call) → nudge ──┐
-                      │       └── (tool call) → act → adapt       │
-                      └────────────── continue ───────────────────┘
-                                          │
-                            (done / budget) → finalize → END
+                      ↑       ├── (prose, no tool call) → nudge ────────┐
+                      │       ├── (failed assertion) → assert_retry ────┤
+                      │       └── (valid tool call) → act → adapt ──────┤
+                      └───────────────── continue ──────────────────────┘
+                                            │
+                              (done / budget) → finalize → END
 ```
 
 `adapt` is the node that earns the structure. It runs after every action and owns the whole exploration policy: stagnation detection, memory eviction, and the state-exhaustion fallback. As a node rather than a branch inside a `while` loop, it is testable without an LLM, inspectable mid-episode, and checkpointable.
 
 ### The evolution graph — one generation
 
-```
+```text
   START → sample_tasks ─(Send fan-out)→ rollout → score → induce → credit → prune
                 ↑                                                              │
                 │                                                              ▼
@@ -113,7 +114,7 @@ queried by similarity. A JSONL file handles one of those, which is why storage
 is pluggable — pick a backend with a URL and nothing else changes.
 
 | Backend | URL | What it adds |
-|---|---|---|
+| --- | --- | --- |
 | **File** (default) | `memories.jsonl` | Nothing to install. Atomic replace on write, so an interrupted save cannot destroy the bank. |
 | **Postgres + pgvector** | `postgresql://…` | Atomic credit increments, server-side ANN, one bank shared across runs. |
 | **MongoDB** | `mongodb://…` | Durability and safe concurrent writes. Vector search only on Atlas; otherwise it says so and the bank scores in Python. |
@@ -161,7 +162,7 @@ meta-evolver graph regressions --run-id run-a1b2c3d4 --cypher   # paste into the
 
 Six node labels, and every edge means *caused / produced / was used by*:
 
-```
+```text
 (:Run)-[:HAS_GENERATION]->(:Generation)-[:RAN]->(:Episode)-[:ON_TASK]->(:Task)
 (:Generation)-[:USED_PROMPT]->(:Prompt)   (:Generation)-[:AT_LEVEL]->(:CurriculumLevel)
 (:Episode)-[:RETRIEVED]->(:Memory)        ← the memory was in the prompt
@@ -288,7 +289,7 @@ Embeddings are a *separate* model from the chat model, on purpose: a scripted or
 
 ## Layout
 
-```
+```text
 meta_evolver/
   core/        types, ActionableEnv, Rules harness, flex (dynamic code), registry, seeding
   graphs/      episode.py (assertions + backtracks), evolution.py, state.py
@@ -311,7 +312,7 @@ meta_evolver/
 
 ```bash
 pip install -e ".[dev]"
-pytest -q          # 143 tests, no network; DB tests skip if nothing is listening
+pytest -q          # 165 passed tests, no network; DB tests skip if nothing is listening
 ```
 
 To exercise the database backends too:

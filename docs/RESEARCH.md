@@ -15,7 +15,7 @@ The survey formalises a modern agent as `A = (θ, Σ)`: foundation-model paramet
 The survey's taxonomy of scaffolding improvement maps onto the codebase directly:
 
 | Survey category | Meta-Evolver |
-|---|---|
+| --- | --- |
 | Prompt optimization (`p → p'`) | [`prompts/optimizer.py`](../meta_evolver/prompts/optimizer.py) — OPRO with held-out selection |
 | Evaluation: "report trajectories, transfer, resource cost, regression rates" | [`core/types.py`](../meta_evolver/core/types.py) — `GenerationReport` carries all four, including per-generation token spend |
 | Memory evolution (`m → m'`) | [`memory/bank.py`](../meta_evolver/memory/bank.py) — vector retrieval, MMR, credit-driven CRUD |
@@ -118,6 +118,19 @@ This is closest in spirit to EnvHarness-style environment mutation: the `Rules` 
 
 ---
 
+## Declarative Scaffolding & LM Compiler Grounding
+
+[**DSPy: Compiling Declarative Language Model Calls into State-of-the-Art Pipelines**](https://arxiv.org/abs/2310.03714) — Khattab et al. (Stanford NLP, 2023/2024)
+
+DSPy treats prompt engineering as a compiler problem: optimize pipeline modules, few-shot demos, and instructions against objective metrics. Meta-Evolver adapts these principles into the embodied agent harness:
+
+1. **In-Flight Semantic Assertions (`tools/assertions.py`)**: Inspired by `dspy.Assert` and `dspy.Suggest`. Validates actions and parameters *before* execution; hard failures trigger intra-step feedback loops (`assert_retry` node) without burning environment steps.
+2. **Multi-Component Pareto Reflection (`prompts/gepa.py`)**: Adapts DSPy's GEPA optimizer. Decomposes instructions into `ModularPrompt` components, tracks a multi-task Pareto frontier, and mutates components using rich natural-language feedback and crossover (`merge`).
+3. **Variable Space vs. Token Space (`tools/repl.py`)**: Adapts `dspy.RLM` (Recursive Language Model) to decouple large observations from prompt tokens. Observations live in sandboxed REPL variables; the agent inspects metadata and calls recursive `llm_query` primitives with bounded call budgets.
+4. **Code Scaffolding as an Optimizable Parameter (`core/flex.py`)**: Adapts `dspy.Flex` to allow synthesized Python module code and harness rules (`FlexRule`) to be compiled, evaluated, and evolved within an isolated execution sandbox.
+
+---
+
 ## Provenance as a graph
 
 A gap the survey names but does not solve: self-improvement rewrites shared
@@ -171,8 +184,9 @@ A copy of the survey is kept at
 [`papers/2607.13104-self-improving-agents-survey.pdf`](papers/2607.13104-self-improving-agents-survey.pdf).
 
 | Paper | Relevance |
-|---|---|
+| --- | --- |
 | [Self-Improvements in Modern Agentic Systems: A Survey](https://arxiv.org/abs/2607.13104) | The frame. Start here. |
+| [DSPy: Compiling Declarative Language Model Calls](https://arxiv.org/abs/2310.03714) | Declarative LM pipelines, MIPROv2, GEPA, Assertions, RLM |
 | [ReasoningBank](https://arxiv.org/abs/2509.25140) | Memory induction; the direct ancestor of `memory/` |
 | [SkillOS](https://arxiv.org/abs/2605.06614) | Curation over accumulation |
 | [MemEvolve](https://arxiv.org/abs/2512.18746) | Meta-evolution of the memory architecture itself |
