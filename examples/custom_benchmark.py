@@ -115,7 +115,7 @@ def main() -> int:
 
     evolver = MetaEvolver(
         benchmark=bench,
-        model="google_genai:gemini-3-flash",
+        model="google_genai:gemini-3.8-flash",
         config=EvolutionConfig(generations=2, max_steps=8, validate_prompt=False),
         telemetry=False,
     )

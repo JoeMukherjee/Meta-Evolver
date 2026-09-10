@@ -15,9 +15,9 @@ thinking level instead. :func:`build_chat_model` strips them for any Gemini
 route while leaving them intact for providers that still honour them, so a
 config carrying ``temperature: 0.4`` stays correct on both.
 
-**Model strings accept either spelling.** ``gemini/gemini-3-flash`` (the
+**Model strings accept either spelling.** ``gemini/gemini-3.8-flash`` (the
 provider-prefixed form this project used before) and
-``google_genai:gemini-3-flash`` (LangChain's) both resolve, so existing
+``google_genai:gemini-3.8-flash`` (LangChain's) both resolve, so existing
 configs and CLI invocations keep working.
 """
 from __future__ import annotations
@@ -110,7 +110,7 @@ DEPRECATED_SAMPLING_PARAMS: tuple[str, ...] = (
 )
 
 #: Default chat model.
-DEFAULT_MODEL = "google_genai:gemini-3-flash"
+DEFAULT_MODEL = "google_genai:gemini-3.8-flash"
 
 #: Default embedding model.
 #:
