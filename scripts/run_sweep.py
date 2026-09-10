@@ -38,6 +38,7 @@ from __future__ import annotations
 import argparse
 import json
 import statistics
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -45,6 +46,14 @@ from typing import Any
 
 REPO = Path(__file__).resolve().parents[1]
 DEFAULT_OUT = REPO.parents[1] / "runs" / "sweeps"
+
+# `meta_evolver` is a source package here, not an installed one, so it is only
+# importable once this directory is on sys.path. The dry-run path used to get
+# this for free as a side effect of importing offline_demo.py (which does its
+# own path insertion); the real path imported meta_evolver directly and never
+# got it, so a live run failed at the first API-backed model construction --
+# after the grid had already printed "N to run" and looked like it started.
+sys.path.insert(0, str(REPO))
 
 #: Difficulty at which the second held-out measurement is taken. 0.65 is the
 #: "noisy + gated" band: transient faults, a verification gate and distractor
@@ -99,8 +108,14 @@ CONDITIONS: list[Condition] = [
 ]
 
 
-def run_key(condition: str, seed: int) -> str:
-    return f"{condition}:seed{seed}"
+def run_key(condition: str, seed: int, generations: int) -> str:
+    """Identity of one cached result.
+
+    Includes ``generations`` deliberately: resuming a sweep after changing
+    --generations must not reuse a row computed under the old budget, or the
+    table would silently mix runs that trained for different lengths.
+    """
+    return f"{condition}:seed{seed}:g{generations}"
 
 
 def load_done(path: Path) -> set[str]:
@@ -116,7 +131,7 @@ def load_done(path: Path) -> set[str]:
             row = json.loads(line)
         except json.JSONDecodeError:
             continue
-        done.add(run_key(row["condition"], row["seed"]))
+        done.add(run_key(row["condition"], row["seed"], row["config"]["generations"]))
     return done
 
 
@@ -342,7 +357,7 @@ def main() -> int:
     done = load_done(results)
     todo = [
         (c, s) for c in chosen for s in range(args.seeds)
-        if run_key(c.name, s) not in done
+        if run_key(c.name, s, args.generations) not in done
     ]
 
     print(f"sweep '{args.name}' -> {results}")
@@ -353,7 +368,7 @@ def main() -> int:
         summarise(results)
         return 0
 
-    model = build_model(args.dry_run, args.model or "google_genai:gemini-3-flash")
+    model = build_model(args.dry_run, args.model or "google_genai:gemini-3.8-flash")
     started = time.time()
 
     for i, (condition, seed) in enumerate(todo, 1):

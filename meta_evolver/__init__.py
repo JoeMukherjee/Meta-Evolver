@@ -11,7 +11,7 @@ Quick start::
 
     from meta_evolver import MetaEvolver
 
-    evolver = MetaEvolver(benchmark="devops", model="gemini/gemini-3-flash")
+    evolver = MetaEvolver(benchmark="devops", model="gemini/gemini-3.8-flash")
     evolver.evolve(generations=4)
     print(evolver.render_progress())
 """

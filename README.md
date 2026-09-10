@@ -285,7 +285,7 @@ Both are self-contained, deterministic, and run offline — no dataset download,
 
 ## Models and embeddings
 
-Chat models are LangChain `BaseChatModel` instances built through `init_chat_model`, so any provider integration works: `--model openai:gpt-4.1`, `--model anthropic:claude-opus-4-7`, `--model google_genai:gemini-3-flash` (default). The older `provider/model` spelling resolves too, so existing configs keep working.
+Chat models are LangChain `BaseChatModel` instances built through `init_chat_model`, so any provider integration works: `--model openai:gpt-4.1`, `--model anthropic:claude-opus-4-7`, `--model google_genai:gemini-3.8-flash` (default). The older `provider/model` spelling resolves too, so existing configs keep working.
 
 LangChain rather than a generic gateway because LangGraph is the orchestration layer here: state carries real `AnyMessage` objects under the `add_messages` reducer, tool calls arrive already normalized on `AIMessage.tool_calls`, and a test double is just another `BaseChatModel`. Nothing in this package re-implements a provider's wire format.
 
