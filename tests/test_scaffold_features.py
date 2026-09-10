@@ -10,15 +10,13 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
-from typing import Any
 
-import pytest
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage
 
 from meta_evolver.benchmarks.devops import DevOpsBenchmark
-from meta_evolver.core.flex import FlexModule, FlexProposer, FlexResult, FlexRule
-from meta_evolver.core.types import Action, EnvResponse, Observation, StepRecord, Trajectory
-from meta_evolver.graphs.episode import arun_episode, build_episode_graph, run_episode
+from meta_evolver.core.flex import FlexModule, FlexProposer, FlexRule
+from meta_evolver.core.types import Action, StepRecord, Trajectory
+from meta_evolver.graphs.episode import build_episode_graph, run_episode
 from meta_evolver.llm.client import ScriptedChatModel, tool_call_message
 from meta_evolver.prompts.gepa import (
     GEPAPromptOptimizer,
@@ -26,17 +24,16 @@ from meta_evolver.prompts.gepa import (
     ParetoCandidate,
     ParetoFrontier,
 )
-from meta_evolver.telemetry.tracer import TelemetryTracer, TraceSpan
+from meta_evolver.telemetry.tracer import TelemetryTracer
 from meta_evolver.tools.assertions import (
     AdmissibleCommandAssertion,
-    AssertionResult,
     AssertionRunner,
     CustomAssertion,
     NonEmptyArgsAssertion,
     NumericRangeAssertion,
     ValidToolAssertion,
 )
-from meta_evolver.tools.repl import REPLExecutionResult, REPLSession, REPLTools, VariableDescriptor
+from meta_evolver.tools.repl import REPLSession, REPLTools
 
 # ---------------------------------------------------------------------------
 # 1. In-Flight Assertions & Backtracking
