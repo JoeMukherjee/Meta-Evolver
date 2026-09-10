@@ -9,12 +9,11 @@ retry loop without advancing the environment step counter.
 """
 from __future__ import annotations
 
-import re
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict
 
 from meta_evolver.core.types import Action
 

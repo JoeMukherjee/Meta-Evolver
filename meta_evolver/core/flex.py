@@ -20,13 +20,11 @@ from __future__ import annotations
 import ast
 import time
 import traceback
-from collections.abc import Callable
-from dataclasses import dataclass, field
 from typing import Any
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict
 
 from meta_evolver.core.env import ActionableEnv
 from meta_evolver.core.rules import Rules
