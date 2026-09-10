@@ -7,9 +7,9 @@ What Meta-Evolver borrows, what it adds, and what it deliberately leaves out.
 ## The frame
 
 <p align="center">
-  <img src="./figures/fig1_system_architecture.png" width="95%" alt="Meta-Evolver Dual-Graph Architecture" />
+  <img src="./figures/meta_evolver_architecture.png" width="95%" alt="Meta-Evolver: outer evolution loop and inner episode loop" />
 </p>
-<p align="center"><em>Figure 1: Dual-Graph Self-Improvement Architecture.</em> The system decouples the Outer Evolution Graph (multi-task fan-out, contrastive memory induction, Bayesian Beta crediting, and curriculum escalation) from the Inner Episode Graph (stateful agent execution, in-flight semantic assertions, and adaptive stagnation eviction).</p>
+<p align="center"><em>Figure 1: the two loops.</em> The outer loop is one generation: sample tasks, fan rollouts out concurrently, score them pass@K, distil contrastive memories, credit and prune the bank, propose and validate a prompt, then escalate the environment. The inner loop is one rollout, with the adaptive controller sitting on <code>adapt</code> and the <code>usable?</code> test separating reasoning failures (which teach) from infrastructure errors (which are discarded). Nothing in the model or the benchmark is updated; only the scaffold between them is.</p>
 
 [**Self-Improvements in Modern Agentic Systems: A Survey**](https://arxiv.org/abs/2607.13104) — Ren, Guo, Rong, Chen, Wang, Li, Yang, Zhuge, Schmidhuber et al. (Jilin University / KAUST / IDSIA, July 2026)
 
@@ -73,9 +73,9 @@ This closes the loop the survey calls signal-driven memory processing (Create/Re
 ## The OOD failure mode
 
 <p align="center">
-  <img src="./figures/fig2_ood_generalization.png" width="95%" alt="ALFWorld OOD Trajectory and Benchmark Breakthrough" />
+  <img src="./figures/fig2_ood_generalization.png" width="95%" alt="Distinct actions tried vs steps taken on an OOD ALFWorld layout" />
 </p>
-<p align="center"><em>Figure 2: Empirical OOD Retrieval Trap Mitigation on ALFWorld.</em> (a) Jump from 0.0% to 100.0% task success rate under out-of-distribution item displacement. (b) 36% step reduction (50 timeout steps vs. 32 efficient steps). (c1-c2) Spatial trajectory comparison demonstrating loop-eviction at Step 6 and systematic drawer/cabinet search.</p>
+<p align="center"><em>Figure 2: the retrieval trap is a saturation phenomenon.</em> Distinct actions tried against steps taken, on an out-of-distribution ALFWorld layout. All four agents open with nearly the same six actions, then diverge. Static retrieval saturates at step 10 and ends having tried 8 distinct actions in 50 steps. Eviction on its own is <em>worse</em>: it saturates at step 5 and reaches only 7, because removing a failed prior leaves nothing in its place. Adding the state-exhaustion fallback keeps the search moving along the no-repetition diagonal, solving the task in 32 steps having tried 30 distinct actions. Curves are the raw action logs, one seed per variant.</p>
 
 Related work converged on the same problem from several directions:
 
@@ -114,9 +114,9 @@ So [`optimizer.py`](../meta_evolver/prompts/optimizer.py) proposes several candi
 ## Curriculum
 
 <p align="center">
-  <img src="./figures/fig3_evolution_crediting.png" width="95%" alt="Curriculum Escalation and Bayesian Utility Dynamics" />
+  <img src="./figures/fig3_algorithm.png" width="95%" alt="The life of a memory: induction, retrieval, crediting, pruning" />
 </p>
-<p align="center"><em>Figure 3: Multi-Generation Curriculum Escalation & Bayesian Memory Crediting.</em> Left: Generational pass rate maintaining 100% resolution under progressively harder fault injection, verification gates, and distractor noise. Right: Bayesian Beta posterior density curves showing high-utility reinforcement ($\mathbb{E}[U]=0.91$) vs. autonomous pruning threshold ($\mathbb{E}[U]=0.25 < \tau=0.34$).</p>
+<p align="center"><em>Figure 3: the life of a memory.</em> One memory followed from birth to eviction. It is induced from a contrastive pair (one attempt solved the task, another did not), retrieved by similarity weighted by utility and re-ranked with MMR, then charged for the outcome of every episode that cited it. Its utility is the Beta(1,1) posterior mean, which starts at 0.5 so an untested memory is neither trusted nor pruned; once it has had a fair trial and fallen below the threshold, it is dropped. Curation rather than accumulation is what keeps the bank improving instead of merely growing.</p>
 
 Not a category in the survey's taxonomy — its scope is the agent, not the environment — but it addresses a problem the survey names directly in its discussion of evaluation: measuring *continuous* improvement.
 
@@ -135,10 +135,6 @@ This is closest in spirit to EnvHarness-style environment mutation: the `Rules` 
 
 ## Declarative Scaffolding & LM Compiler Grounding
 
-<p align="center">
-  <img src="./figures/fig4_declarative_scaffolding.png" width="95%" alt="Declarative Scaffolding Architecture" />
-</p>
-<p align="center"><em>Figure 4: Five Declarative Scaffolding Subsystems.</em> Adapting DSPy compiler mechanisms for API LLMs without parameter updates: (1) <code>ScaffoldAssert</code> in-flight constraint validation & retry, (2) <code>GEPAPromptOptimizer</code> modular Pareto-frontier mutation/crossover, (3) <code>ScaffoldRLM</code> sandboxed variable REPL space, (4) <code>FlexScaffold</code> executable code evolution, and (5) <code>TelemetryTracer</code> OpenTelemetry/MLflow span tracing.</p>
 
 [**DSPy: Compiling Declarative Language Model Calls into State-of-the-Art Pipelines**](https://arxiv.org/abs/2310.03714) — Khattab et al. (Stanford NLP, 2023/2024)
 

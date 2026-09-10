@@ -224,3 +224,6 @@ __marimo__/
 runs/
 memories.jsonl
 prompt.txt
+
+# Generated figure drafts and previews (regenerate with scripts/)
+docs/figures/drafts/

@@ -47,9 +47,9 @@ They are coupled on purpose. A harder curriculum produces richer failures → ri
 ## Two graphs
 
 <p align="center">
-  <img src="./docs/figures/fig1_system_architecture.png" width="95%" alt="Meta-Evolver Dual-Graph System Architecture" />
+  <img src="./docs/figures/meta_evolver_architecture.png" width="95%" alt="Meta-Evolver: outer evolution loop and inner episode loop" />
 </p>
-<p align="center"><em>Figure 1: Dual-Graph Self-Improvement Architecture.</em> The Outer Evolution Graph fans out concurrent rollouts across tasks ($K=3$), collects traces at a scoring barrier, induces contrastive strategies into the Reasoning Bank, updates Bayesian Beta crediting, optimizes prompt components via Pareto frontier search, and escalates environment curriculum difficulty ($0.20 \to 0.80$). The Inner Episode Graph drives the agent rollout with in-flight semantic assertions (`assert_retry`), dynamic prompt rendering, and adaptive stagnation eviction.</p>
+<p align="center"><em>Figure 1: the two loops.</em> The outer loop is one generation: sample tasks, fan rollouts out concurrently, score them pass@K, distil contrastive memories, credit and prune the bank, propose and validate a prompt, then escalate the environment. The inner loop is one rollout, with the adaptive controller sitting on <code>adapt</code> and the <code>usable?</code> test separating reasoning failures (which teach) from infrastructure errors (which are discarded). Nothing in the model or the benchmark is updated; only the scaffold between them is.</p>
 
 ### The episode graph — one rollout
 
@@ -83,9 +83,9 @@ Rollouts fan out concurrently with LangGraph's `Send`; `score` is the barrier th
 ## What makes the loop actually converge
 
 <p align="center">
-  <img src="./docs/figures/fig3_evolution_crediting.png" width="95%" alt="Multi-Generation Progression and Bayesian Crediting" />
+  <img src="./docs/figures/fig3_algorithm.png" width="95%" alt="The life of a memory: induction, retrieval, crediting, pruning" />
 </p>
-<p align="center"><em>Figure 2: Empirical Self-Evolution & Bayesian Crediting Dynamics.</em> (a) Multi-generation evolution maintains a 100% pass rate under escalating curriculum difficulty (faults, noise, verification gates). (b) Posterior Beta distributions $\mathrm{Beta}(\mathrm{wins}+1, \mathrm{uses}-\mathrm{wins}+1)$ for active high-utility strategies ($\mathbb{E}[U]=0.91$) versus pruned counter-productive strategies ($\mathbb{E}[U]=0.25$, pruned below $U=0.34$).</p>
+<p align="center"><em>Figure 3: the life of a memory.</em> One memory followed from birth to eviction. It is induced from a contrastive pair (one attempt solved the task, another did not), retrieved by similarity weighted by utility and re-ranked with MMR, then charged for the outcome of every episode that cited it. Its utility is the Beta(1,1) posterior mean, which starts at 0.5 so an untested memory is neither trusted nor pruned; once it has had a fair trial and fallen below the threshold, it is dropped. Curation rather than accumulation is what keeps the bank improving instead of merely growing.</p>
 
 Most of the design here is about *not* fooling yourself. Five decisions do the work:
 
@@ -104,9 +104,9 @@ Most of the design here is about *not* fooling yourself. Five decisions do the w
 ## Retrieved memory as a trap, and the fix
 
 <p align="center">
-  <img src="./docs/figures/fig2_ood_generalization.png" width="95%" alt="ALFWorld Out-Of-Distribution Generalization" />
+  <img src="./docs/figures/fig2_ood_generalization.png" width="95%" alt="Distinct actions tried vs steps taken on an OOD ALFWorld layout" />
 </p>
-<p align="center"><em>Figure 3: Out-Of-Distribution (OOD) Retrieval Trap Mitigation on ALFWorld.</em> (a) OOD pass rate jumps from 0.0% to 100.0% under our adaptive controller. (b) Interaction steps drop from 50 (budget exhausted) to 32 (-36% steps, 44.6% faster). (c1) Static retrieval gets trapped in endless loops checking countertops. (c2) Adaptive controller evicts the prior at step 6 and systematically explores unvisited drawers/cabinets to find the target.</p>
+<p align="center"><em>Figure 2: the retrieval trap is a saturation phenomenon.</em> Distinct actions tried against steps taken, on an out-of-distribution ALFWorld layout. All four agents open with nearly the same six actions, then diverge. Static retrieval saturates at step 10 and ends having tried 8 distinct actions in 50 steps. Eviction on its own is <em>worse</em>: it saturates at step 5 and reaches only 7, because removing a failed prior leaves nothing in its place. Adding the state-exhaustion fallback keeps the search moving along the no-repetition diagonal, solving the task in 32 steps having tried 30 distinct actions. Curves are the raw action logs, one seed per variant.</p>
 
 Retrieval-augmented agents have a specific, reproducible failure mode on out-of-distribution tasks. The bank returns the nearest strategy; the strategy does not apply; the agent follows it anyway, because a confident instruction in the system prompt outweighs a few discouraging observations. It then loops — re-checking the places the memory named, growing more certain with each empty result. **More retrieval makes this worse**: the same wrong prior is re-injected every turn.
 
@@ -247,10 +247,6 @@ See [`examples/custom_benchmark.py`](examples/custom_benchmark.py) for the whole
 
 ## Advanced Scaffolding Subsystems (API LLM / Frozen-Weight Optimization)
 
-<p align="center">
-  <img src="./docs/figures/fig4_declarative_scaffolding.png" width="95%" alt="5 Declarative Scaffolding Subsystems" />
-</p>
-<p align="center"><em>Figure 4: Five Declarative Scaffolding Subsystems for API-Only LLMs.</em> Meta-Evolver optimizes the execution harness rather than model weights via: (1) <code>ScaffoldAssert</code> in-flight constraint validation and zero-penalty backtracking, (2) <code>GEPAPromptOptimizer</code> modular Pareto-frontier mutation and crossover, (3) <code>ScaffoldRLM</code> sandboxed variable REPL with recursive sub-LLM calls, (4) <code>FlexScaffold</code> executable code evolution, and (5) <code>TelemetryTracer</code> hierarchical span tracing.</p>
 
 Meta-Evolver operates entirely at the **scaffolding layer**, enabling continuous self-improvement across API-only LLMs without modifying foundation model weights:
 
