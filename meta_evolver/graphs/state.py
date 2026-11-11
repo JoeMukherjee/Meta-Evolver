@@ -50,6 +50,11 @@ class EpisodeRuntime:
 
     env: Any
     controller: Any = None
+    tracer: Any = None
+    """Optional :class:`~meta_evolver.telemetry.tracer.TelemetryTracer` for
+    this episode. ``Any`` rather than the concrete type to keep this module
+    decoupled from ``telemetry``; ``None`` means tracing is off, the default,
+    and every node checks for that before touching it."""
 
 
 class EpisodeState(TypedDict, total=False):
@@ -153,6 +158,15 @@ class EvolutionState(TypedDict, total=False):
     in one node cannot be closed in another -- resetting the context variable
     raises. Each spending node therefore meters itself and reports a number,
     and ``checkpoint`` adds them to the rollouts' own totals."""
+    tool_tokens: int
+    tool_note: str
+
+    adopted_tools: Annotated[list[dict[str, Any]], operator.add]
+    """One entry per tool that cleared both self-modification gates (the
+    sandbox and held-out validation), across the whole run -- the audit
+    trail :class:`~meta_evolver.adapter.MetaAdapter` reads to carry adopted
+    tools, and only adopted tools, across a ``save``/``attach``. Empty
+    (the default) is today's behaviour: no tool self-modification."""
 
     # -- history / control -------------------------------------------------
     last_outcomes: dict[str, bool]
@@ -164,6 +178,16 @@ class EvolutionState(TypedDict, total=False):
     best_pass_rate: float
     generations_without_gain: int
     stop_reason: str
+
+    rehearsal_ids: list[str]
+    """Task ids the current prompt is known to pass -- drawn from both the
+    held-out split and each generation's train rollouts, bounded to
+    ``EvolutionConfig.rehearsal_size`` (oldest dropped first). A prompt
+    challenger must also clear this set (within ``rehearsal_tolerance``) to
+    be adopted -- not just beat the incumbent on the current held-out split
+    -- so a prompt rewrite tuned for a new failure cannot silently break
+    something that used to work. Empty (the default) runs no rehearsal
+    check."""
 
 
 class RolloutInput(TypedDict, total=False):

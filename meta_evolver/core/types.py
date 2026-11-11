@@ -220,14 +220,64 @@ class MemoryItem(BaseModel):
     wins: int = 0
     created_generation: int = 0
     last_used_generation: int = 0
+    domain_stats: dict[str, list[float]] = Field(default_factory=dict)
+    """``domain -> [wins, uses]``, populated only when a caller tells
+    :meth:`record_domain_usage` what domain an episode belonged to. Floats,
+    not ints, because :attr:`utility_decay`-driven accrual scales existing
+    counts down before adding the new one -- an integer field could not
+    represent that. An item with no domain signal yet has an empty dict here;
+    :meth:`utility_for` then falls back to the plain global figure, which is
+    what makes "domain conditioning on, but this item has no domain data"
+    behave identically to domain conditioning being off for that item."""
 
     @property
     def utility(self) -> float:
         """Posterior mean of a Beta(1,1) prior over "episodes citing this
         memory succeed". An unused item sits at 0.5 -- neither trusted nor
         pruned -- so a new memory gets a fair number of trials before the
-        pruner can judge it."""
+        pruner can judge it.
+
+        Always the plain, global, undiscounted figure over lifetime
+        ``wins``/``uses`` -- unaffected by domain conditioning or decay. Those
+        are opt-in through :meth:`utility_for` and :meth:`record_domain_usage`
+        precisely so this property, and every existing caller of it, never
+        changes behaviour."""
         return (self.wins + 1.0) / (self.uses + 2.0)
+
+    def record_domain_usage(self, domain: str, success: bool, gamma: float = 1.0) -> None:
+        """Credit one episode's outcome to ``domain``'s own running count.
+
+        ``gamma`` discounts the *existing* count before adding the new event
+        (``count = gamma * count + 1``, matching the vault's discounted Beta
+        accrual note) -- so a rule that was strong three hundred episodes ago
+        in a domain nobody visits any more does not need three hundred
+        offsetting failures before the pruner can act on it. ``gamma=1.0``
+        (the default) never discounts; domain stats then just accumulate
+        like a second, domain-scoped set of lifetime counters.
+
+        Does not touch ``wins``/``uses`` -- those stay exactly as
+        :meth:`~meta_evolver.memory.bank.ReasoningMemoryBank.credit_assign`
+        has always maintained them.
+        """
+        wins, uses = self.domain_stats.get(domain, [0.0, 0.0])
+        wins *= gamma
+        uses *= gamma
+        uses += 1.0
+        if success:
+            wins += 1.0
+        self.domain_stats[domain] = [wins, uses]
+
+    def utility_for(self, domain: str | None = None) -> float:
+        """:attr:`utility`, optionally conditioned on ``domain``.
+
+        ``domain=None``, or a domain this item has no data for, returns
+        exactly :attr:`utility` -- so turning domain conditioning on for a
+        bank costs nothing for items nobody has tagged with a domain yet.
+        """
+        if domain is None or domain not in self.domain_stats:
+            return self.utility
+        wins, uses = self.domain_stats[domain]
+        return (wins + 1.0) / (uses + 2.0)
 
     def key(self) -> str:
         """Stable identity for dedup: scenario plus normalized lesson text."""

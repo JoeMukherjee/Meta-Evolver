@@ -146,6 +146,7 @@ class Embedder:
         model: str | None = None,
         dimensions: int | None = None,
         dim: int | None = None,
+        redis_url: str | None = None,
     ) -> None:
         if embeddings is None and model is not None:
             embeddings = build_embeddings(model, dimensions=dimensions)
@@ -159,6 +160,16 @@ class Embedder:
         self.remote_available = embeddings is not None
         self.n_remote = 0
         self.n_fallback = 0
+
+        # Second-level cache, shared across processes. Checked before the
+        # remote/fallback compute path and filled on a miss; the in-memory
+        # dict above still exists underneath it and absorbs repeat lookups
+        # within one process without a network round trip each time. `None`
+        # (the default -- no $META_EVOLVER_REDIS_URL, or Redis unreachable)
+        # makes this identical to every Embedder built before it existed.
+        from meta_evolver.llm.embed_cache import RedisEmbeddingCache
+
+        self.redis_cache = RedisEmbeddingCache.from_env(self.dim, url=redis_url)
 
     def embed_documents(self, texts: Sequence[str]) -> list[list[float]]:
         """Embed text that will be *stored* and later searched over."""
@@ -180,6 +191,19 @@ class Embedder:
         keys = [(kind, t) for t in texts]
         missing = [t for key, t in zip(keys, texts, strict=True) if key not in self._cache]
 
+        if missing and self.redis_cache is not None:
+            # A shared-cache hit is cheaper than either the remote call or
+            # the fallback encoder below, and correct either way -- it is
+            # exactly the vector this process would have computed itself.
+            still_missing = []
+            for text in missing:
+                vec = self.redis_cache.get(kind, text)
+                if vec is not None:
+                    self._cache[(kind, text)] = vec
+                else:
+                    still_missing.append(text)
+            missing = still_missing
+
         if missing and self.remote_available and self.embeddings is not None:
             try:
                 if kind == "query":
@@ -196,7 +220,10 @@ class Embedder:
                 for text, vec in zip(missing, vectors, strict=True):
                     # Normalized on arrival so the bank stays coherent even
                     # across an embedding-model switch. See the module note.
-                    self._cache[(kind, text)] = l2_normalize(vec)
+                    normalized = l2_normalize(vec)
+                    self._cache[(kind, text)] = normalized
+                    if self.redis_cache is not None:
+                        self.redis_cache.set(kind, text, normalized)
                 self.n_remote += len(missing)
                 missing = []
             else:
@@ -208,7 +235,14 @@ class Embedder:
         for text in missing:
             # The local encoder has no notion of task type, so both kinds map
             # to the same vector -- correct, since it is a symmetric encoder.
-            self._cache[(kind, text)] = hashed_embedding(text, self.dim)
+            vec = hashed_embedding(text, self.dim)
+            self._cache[(kind, text)] = vec
+            if self.redis_cache is not None:
+                # Sharing the fallback vector too: two processes without
+                # remote access must still agree on what a given text maps
+                # to, and this is how a Redis-cached run stays consistent
+                # with a remote-embedded one already sitting alongside it.
+                self.redis_cache.set(kind, text, vec)
             self.n_fallback += 1
 
         return [self._cache[key] for key in keys]

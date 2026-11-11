@@ -1,11 +1,12 @@
 """``meta-evolver`` command line.
 
-Four verbs, matching the four things you actually do with this system:
+Five verbs, matching the five things you actually do with this system:
 
     benchmarks   what can I run against
     run          one episode, printed step by step
     evolve       the outer loop, streaming a generation table
     ablate       does the memory bank actually help
+    chat         one live, open-ended conversation in the terminal
     graph        query the causal graph of a run, or print the Cypher to
 
 ``evolve`` streams each generation's line as it completes rather than printing
@@ -30,6 +31,53 @@ from meta_evolver.graph_view.recorder import GRAPH_URL_ENV
 from meta_evolver.graphs.evolution import EvolutionConfig
 from meta_evolver.llm.client import DEFAULT_EMBED_MODEL, DEFAULT_MODEL
 from meta_evolver.storage.base import DB_URL_ENV
+
+def _coerce(value: str):
+    """``--bench-arg`` values arrive as text; give numbers and booleans back
+    their types so ``limit=50`` reaches a constructor as an int."""
+    low = value.lower()
+    if low in ("true", "false"):
+        return low == "true"
+    for cast in (int, float):
+        try:
+            return cast(value)
+        except ValueError:
+            continue
+    return value
+
+
+def _bench_kwargs(
+    data_path: Path | None, limit: int | None, bench_arg: list[str] | None
+) -> dict:
+    """Constructor kwargs for a benchmark that needs them.
+
+    Built-in benchmarks take none, so nothing is forwarded unless asked for --
+    passing ``limit`` to an adapter with no such parameter should fail loudly
+    at the call site, not be silently swallowed here.
+    """
+    kwargs: dict = {}
+    if data_path is not None:
+        kwargs["data_path"] = data_path
+    if limit:
+        kwargs["limit"] = limit
+    for item in bench_arg or []:
+        if "=" not in item:
+            raise typer.BadParameter(f"--bench-arg expects key=value, got {item!r}")
+        key, value = item.split("=", 1)
+        kwargs[key.strip()] = _coerce(value.strip())
+    return kwargs
+
+
+def _attach_judge(bench, model) -> None:
+    """Benchmarks graded by an LLM judge default to the run's own model."""
+    if hasattr(bench, "judge_model") and getattr(bench, "judge_model") is None:
+        bench.judge_model = model
+
+
+_DATA_PATH_HELP = "Dataset file for benchmarks that need one (longmemeval, locomo)."
+_LIMIT_HELP = "Run on a stratified subset of this many tasks."
+_BENCH_ARG_HELP = "Extra benchmark constructor argument, key=value. Repeatable."
+
 
 app = typer.Typer(
     help="Meta-Evolver: a LangGraph engine for agents that improve on any benchmark.",
@@ -74,9 +122,12 @@ def run(
     max_steps: int = typer.Option(15),
     curriculum_level: float = typer.Option(0.0, help="0 = clean env, 1 = fully adversarial."),
     no_memory: bool = typer.Option(False, "--no-memory", help="Disable retrieval."),
+    data_path: Path | None = typer.Option(None, "--data-path", help=_DATA_PATH_HELP),
+    limit: int | None = typer.Option(None, "--limit", help=_LIMIT_HELP),
+    bench_arg: list[str] = typer.Option([], "--bench-arg", help=_BENCH_ARG_HELP),
 ) -> None:
     """Run a single episode and print the trajectory."""
-    bench = get_benchmark(benchmark)
+    bench = get_benchmark(benchmark, **_bench_kwargs(data_path, limit, bench_arg))
     task_id = task or (bench.task_ids("train") or bench.task_ids("all"))[0]
 
     evolver = MetaEvolver(
@@ -90,6 +141,7 @@ def run(
         telemetry=False,
     )
     evolver.curriculum_level = curriculum_level
+    _attach_judge(bench, evolver.model)
     result = evolver.evaluate(task_ids=[task_id], curriculum_level=curriculum_level,
                               use_memory=not no_memory)
     trajectory = result["trajectories"][0]
@@ -155,6 +207,12 @@ def evolve(
         "--no-validation",
         help="Adopt prompt candidates without a held-out check. Faster, and weaker.",
     ),
+    data_path: Path | None = typer.Option(None, "--data-path", help=_DATA_PATH_HELP),
+    limit: int | None = typer.Option(None, "--limit", help=_LIMIT_HELP),
+    bench_arg: list[str] = typer.Option([], "--bench-arg", help=_BENCH_ARG_HELP),
+    max_total_tokens: int | None = typer.Option(
+        None, help="Stop starting new generations once this many tokens are spent."
+    ),
 ) -> None:
     """Run the evolution loop, streaming one line per generation."""
     config = EvolutionConfig(
@@ -165,9 +223,11 @@ def evolve(
         curriculum=not no_curriculum,
         optimize_prompt=not no_prompt_evolution,
         validate_prompt=not no_validation,
+        max_total_tokens=max_total_tokens,
     )
+    bench = get_benchmark(benchmark, **_bench_kwargs(data_path, limit, bench_arg))
     evolver = MetaEvolver(
-        benchmark=benchmark,
+        benchmark=bench,
         model=model,
         embed_model=embed_model,
         embed_dimensions=embed_dimensions,
@@ -180,6 +240,7 @@ def evolve(
         config=config,
         controller_config=AdaptiveControllerConfig(patience=patience),
     )
+    _attach_judge(bench, evolver.model)
 
     console.print(
         f"[bold]{evolver.benchmark.name}[/bold] via [cyan]{evolver.model_name}[/cyan] "
@@ -273,6 +334,51 @@ def ablate(
 
     delta = (with_memory["pass_rate"] - without["pass_rate"]) * 100
     console.print(f"[bold]memory delta: {delta:+.1f} points[/bold]")
+
+
+@app.command()
+def chat(
+    model: str = typer.Option(DEFAULT_MODEL, help="Any LangChain model id, e.g. openai:gpt-4.1."),
+    embed_model: str = typer.Option(DEFAULT_EMBED_MODEL, help="Embedding model."),
+    embed_dimensions: int = typer.Option(768, help="Embedding width (128-3072)."),
+    memory: Path | None = typer.Option(None, help="Memory bank JSONL to retrieve from and save to."),
+    system_prompt: str | None = typer.Option(None, help="Override the starting system prompt."),
+    max_steps: int = typer.Option(200, help="Safety cap on total exchanges."),
+    no_memory: bool = typer.Option(False, "--no-memory", help="Disable retrieval."),
+) -> None:
+    """Have one live conversation in the terminal, through this harness.
+
+    Same engine as ``run``/``evolve`` -- the evolved prompt and the memory
+    bank both apply -- but driven by your typed input instead of a scripted
+    benchmark task. Type ``exit``, ``quit`` or ``/end`` to leave.
+    """
+    from meta_evolver.benchmarks.chat import ChatBenchmark
+
+    evolver = MetaEvolver(
+        benchmark=ChatBenchmark(system_prompt=system_prompt),
+        model=model,
+        embed_model=embed_model,
+        embed_dimensions=embed_dimensions,
+        memory_path=memory,
+        use_memory=not no_memory,
+        telemetry=False,
+    )
+    console.print(
+        f"[bold]chat[/bold] via [cyan]{evolver.model_name}[/cyan] "
+        f"-- type 'exit' to leave\n"
+    )
+    try:
+        trajectory = evolver.chat(
+            max_steps=max_steps,
+            on_reply=lambda text: console.print(f"[bold green]Assistant:[/bold green] {text}"),
+        )
+    except KeyboardInterrupt:
+        console.print("\n[yellow]session ended[/yellow]")
+        return
+    console.print(f"\n[dim]session ended -- {trajectory.n_steps} exchanges[/dim]")
+    if memory is not None:
+        saved = evolver.save(memory_path=memory)
+        console.print(f"[dim]memory -> {saved['memory']}[/dim]")
 
 
 @app.command()

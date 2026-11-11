@@ -6,7 +6,7 @@ carries real ``AnyMessage`` objects under the ``add_messages`` reducer, tool
 calls arrive already normalized on ``AIMessage.tool_calls``, and a test double
 is just another ``BaseChatModel``. Nothing here re-implements a message format.
 
-Two provider details are handled centrally, because scattering them across
+Three provider details are handled centrally, because scattering them across
 call sites guarantees drift:
 
 **Gemini removed the manual sampling overrides.** ``temperature``, ``top_p``
@@ -14,6 +14,15 @@ and ``top_k`` are deprecated on the Gemini API -- generation is steered by the
 thinking level instead. :func:`build_chat_model` strips them for any Gemini
 route while leaving them intact for providers that still honour them, so a
 config carrying ``temperature: 0.4`` stays correct on both.
+
+**Gemini's reasoning is billed whether or not it is shown.** A live call
+against this project's own DevOps benchmark, unconfigured, spent 55 of 84
+output tokens (65%) on ``thinking`` content the caller never sees -- for one
+mechanical tool pick. :func:`build_chat_model` sets ``thinking_level`` to
+:data:`DEFAULT_THINKING_LEVEL` on every Gemini route unless the caller already
+supplied one, because leaving it at the provider default silently pays that
+tax on every call this package makes: policy turns, memory induction, prompt
+proposals and their validation rollouts alike.
 
 **Model strings accept either spelling.** ``gemini/gemini-3.8-flash`` (the
 provider-prefixed form this project used before) and
@@ -111,6 +120,16 @@ DEPRECATED_SAMPLING_PARAMS: tuple[str, ...] = (
 
 #: Default chat model.
 DEFAULT_MODEL = "google_genai:gemini-3.8-flash"
+
+#: Gemini 3+ thinking level :func:`build_chat_model` sets by default.
+#:
+#: One of ``"minimal"``, ``"low"``, ``"medium"``, ``"high"`` -- Gemini's own
+#: names, applied as-is. ``"low"`` is documented as minimising latency and
+#: cost while still reasoning, which suits this package's calls: the policy
+#: is picking one tool per turn, and induction/optimization are reflecting
+#: over a handful of traces, not proving theorems. Set to ``None`` to leave
+#: the provider's own default thinking level in place.
+DEFAULT_THINKING_LEVEL: str | None = "low"
 
 #: Default embedding model.
 #:
@@ -232,6 +251,7 @@ def build_chat_model(
     max_retries: int = 5,
     timeout: float | None = 120.0,
     requests_per_second: float | None = None,
+    thinking_level: str | None = DEFAULT_THINKING_LEVEL,
     **kwargs: Any,
 ) -> BaseChatModel:
     """A LangChain chat model for ``model``.
@@ -242,6 +262,12 @@ def build_chat_model(
 
     ``requests_per_second`` throttles client-side. Worth setting whenever
     rollouts run concurrently against a single key.
+
+    ``thinking_level`` sets Gemini's reasoning depth -- see
+    :data:`DEFAULT_THINKING_LEVEL`. Applied only on a Gemini route, and only
+    when ``kwargs`` does not already carry ``thinking_level`` or its alias
+    ``reasoning_effort``, so an explicit per-call value always wins over this
+    default.
     """
     from langchain.chat_models import init_chat_model
 
@@ -252,6 +278,12 @@ def build_chat_model(
     if sampling_params_deprecated(spec):
         for param in DEPRECATED_SAMPLING_PARAMS:
             kwargs.pop(param, None)
+        if (
+            thinking_level is not None
+            and "thinking_level" not in kwargs
+            and "reasoning_effort" not in kwargs
+        ):
+            kwargs["thinking_level"] = thinking_level
 
     limiter = build_rate_limiter(requests_per_second)
     if limiter is not None:

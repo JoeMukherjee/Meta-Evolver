@@ -21,6 +21,9 @@ _REGISTRY: dict[str, type] = {}
 _BUILTIN_MODULES = (
     "meta_evolver.benchmarks.devops",
     "meta_evolver.benchmarks.textworld",
+    "meta_evolver.benchmarks.chat",
+    "meta_evolver.benchmarks.longmemeval",
+    "meta_evolver.benchmarks.locomo",
 )
 
 T = TypeVar("T", bound=type)

@@ -135,6 +135,44 @@ class BenchmarkAdapter(ABC):
         return f"<{type(self).__name__} name={self.name!r} tasks={len(self.task_ids('all'))}>"
 
 
+def stratified_subset(
+    items: Sequence[Any], n: int | None, seed: int, key: Any
+) -> list[Any]:
+    """At most ``n`` of ``items``, proportionally across ``key(item)`` strata.
+
+    For running a large external benchmark on a budget: a plain random cut of
+    50 questions can miss a whole category, and then a per-category breakdown
+    is silently about fewer categories than it claims. Deterministic in
+    ``seed``, and the result keeps the input's relative order so a split that
+    depends on position (an ``eval`` slice, say) stays stable.
+    """
+    items = list(items)
+    if not n or n >= len(items):
+        return items
+
+    groups: dict[Any, list[int]] = {}
+    for i, item in enumerate(items):
+        groups.setdefault(key(item), []).append(i)
+
+    chosen: list[int] = []
+    leftovers: list[list[int]] = []
+    for label in sorted(groups, key=str):
+        idxs = groups[label]
+        derive_rng("subset", seed, str(label)).shuffle(idxs)
+        quota = (n * len(idxs)) // len(items)
+        chosen.extend(idxs[:quota])
+        leftovers.append(idxs[quota:])
+
+    # Floors leave a remainder; hand it out one per stratum so a small
+    # category is represented before a large one gets a second extra.
+    while len(chosen) < n and any(leftovers):
+        for rest in leftovers:
+            if rest and len(chosen) < n:
+                chosen.append(rest.pop(0))
+
+    return [items[i] for i in sorted(chosen)]
+
+
 # ---------------------------------------------------------------------------
 # Tool-schema helper -- most adapters need this and it is fiddly to get right
 # ---------------------------------------------------------------------------

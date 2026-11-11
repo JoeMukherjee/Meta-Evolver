@@ -132,6 +132,73 @@ def test_sampling_params_survive_for_providers_that_accept_them(monkeypatch):
     assert captured["top_p"] == 0.9
 
 
+def test_thinking_level_defaults_to_low_for_gemini(monkeypatch):
+    """Reasoning is billed as output tokens whether or not it is shown.
+
+    Left at the provider default, a live call against this project's own
+    benchmark spent 65% of its output tokens on invisible reasoning for one
+    tool pick. `build_chat_model` sets a level rather than leaving that on.
+    """
+    import langchain.chat_models as lc
+
+    import meta_evolver.llm.client as client_module
+
+    captured: dict = {}
+    monkeypatch.setattr(
+        lc, "init_chat_model", lambda name, **kw: captured.update(kw) or object()
+    )
+
+    client_module.build_chat_model("gemini/gemini-3-flash")
+    assert captured["thinking_level"] == "low"
+
+
+def test_thinking_level_is_not_forced_on_other_providers(monkeypatch):
+    import langchain.chat_models as lc
+
+    import meta_evolver.llm.client as client_module
+
+    captured: dict = {}
+    monkeypatch.setattr(
+        lc, "init_chat_model", lambda name, **kw: captured.update(kw) or object()
+    )
+
+    client_module.build_chat_model("openai/gpt-4.1")
+    assert "thinking_level" not in captured
+
+
+@pytest.mark.parametrize("override_key", ["thinking_level", "reasoning_effort"])
+def test_thinking_level_default_never_overrides_a_caller_value(monkeypatch, override_key):
+    import langchain.chat_models as lc
+
+    import meta_evolver.llm.client as client_module
+
+    captured: dict = {}
+    monkeypatch.setattr(
+        lc, "init_chat_model", lambda name, **kw: captured.update(kw) or object()
+    )
+
+    client_module.build_chat_model("gemini/gemini-3-flash", **{override_key: "high"})
+    assert captured[override_key] == "high"
+    # The default is never injected alongside an explicit caller value under
+    # the *other* name -- that would hand the provider two conflicting keys.
+    other_key = "reasoning_effort" if override_key == "thinking_level" else "thinking_level"
+    assert other_key not in captured
+
+
+def test_thinking_level_none_disables_the_default(monkeypatch):
+    import langchain.chat_models as lc
+
+    import meta_evolver.llm.client as client_module
+
+    captured: dict = {}
+    monkeypatch.setattr(
+        lc, "init_chat_model", lambda name, **kw: captured.update(kw) or object()
+    )
+
+    client_module.build_chat_model("gemini/gemini-3-flash", thinking_level=None)
+    assert "thinking_level" not in captured
+
+
 def test_embedding_defaults_to_gemini_embedding_2_at_reduced_width():
     """`-2` renormalizes truncated output; `-001` leaves it non-unit-norm."""
     provider, name = split_model(DEFAULT_EMBED_MODEL)

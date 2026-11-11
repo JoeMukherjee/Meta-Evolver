@@ -67,6 +67,11 @@ class ReasoningMemoryBank:
             self.items.append(raw if isinstance(raw, MemoryItem) else MemoryItem(**raw))
         if store is not None and not self.items:
             self.items = store.load()
+        self.archived: list[MemoryItem] = []
+        """Items an archive-mode :meth:`prune` set aside rather than deleted.
+        Always empty for a bank that has never pruned in that mode -- this is
+        additive state, never persisted anywhere a bank predating it would
+        look, so an old memory file loads exactly as it always did."""
         self._reindex()
 
     @classmethod
@@ -104,28 +109,52 @@ class ReasoningMemoryBank:
                 except (json.JSONDecodeError, ValueError):
                     # A single corrupt line should cost one memory, not the run.
                     continue
-        return cls(items=items, embedder=embedder, path=p, **kwargs)
+        bank = cls(items=items, embedder=embedder, path=p, **kwargs)
+        archive_path = _archive_path(p)
+        if archive_path.exists():
+            for line in archive_path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    bank.archived.append(MemoryItem(**json.loads(line)))
+                except (json.JSONDecodeError, ValueError):
+                    continue
+        return bank
 
     def save(self, path: str | Path | None = None) -> Path | str:
         """Persist the bank.
 
         With a store configured this is an upsert of the in-memory items; the
         store decides what durability means. Without one it writes JSONL to
-        ``path``, which is the historical behaviour.
+        ``path``, which is the historical behaviour. Archived items -- if
+        any -- always go to a JSONL sidecar next to ``path`` regardless of
+        whether a store is configured, since a store's schema was never
+        designed to hold them and :meth:`revive` only ever reads the sidecar.
         """
         if self.store is not None and path is None:
             self.store.upsert(self.items)
-            return self.store.describe
+            result: Path | str = self.store.describe
+            target_for_archive = self.path
+        else:
+            target = Path(path) if path else self.path
+            if target is None:
+                raise ValueError("no path or store configured for this bank")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with target.open("w", encoding="utf-8") as fh:
+                for item in self.items:
+                    fh.write(json.dumps(item.model_dump(), ensure_ascii=False) + "\n")
+            self.path = target
+            result = target
+            target_for_archive = target
 
-        target = Path(path) if path else self.path
-        if target is None:
-            raise ValueError("no path or store configured for this bank")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        with target.open("w", encoding="utf-8") as fh:
-            for item in self.items:
-                fh.write(json.dumps(item.model_dump(), ensure_ascii=False) + "\n")
-        self.path = target
-        return target
+        if self.archived and target_for_archive is not None:
+            archive_path = _archive_path(target_for_archive)
+            archive_path.parent.mkdir(parents=True, exist_ok=True)
+            with archive_path.open("w", encoding="utf-8") as fh:
+                for item in self.archived:
+                    fh.write(json.dumps(item.model_dump(), ensure_ascii=False) + "\n")
+        return result
 
     def reload(self) -> None:
         """Re-read from the store, picking up another process's writes."""
@@ -323,18 +352,33 @@ class ReasoningMemoryBank:
     # -- learning ----------------------------------------------------------
 
     def credit_assign(
-        self, episodes: Sequence[tuple[Sequence[str], bool]], generation: int = 0
+        self,
+        episodes: Sequence[
+            tuple[Sequence[str], bool] | tuple[Sequence[str], bool, str | None]
+        ],
+        generation: int = 0,
+        gamma: float = 1.0,
     ) -> None:
-        """Update usage statistics from ``(retrieved_ids, success)`` pairs.
+        """Update usage statistics from ``(retrieved_ids, success)`` pairs,
+        or ``(retrieved_ids, success, domain)`` triples.
 
         This is the feedback edge that makes the bank a learner rather than a
         cache. Episodes that ended in an infrastructure error must be filtered
         out *before* this call -- charging a memory for a rate-limit would
         eventually prune the bank's best strategies.
+
+        A triple's ``domain`` (a benchmark's task category, or the benchmark
+        name itself -- whatever the caller considers a domain boundary) also
+        feeds :meth:`~meta_evolver.core.types.MemoryItem.record_domain_usage`
+        with the given ``gamma``. Plain pairs -- every existing caller -- skip
+        that entirely, so nothing about today's global ``wins``/``uses``
+        accounting changes.
         """
         by_id = {item.id: item for item in self.items}
         events: list[tuple[str, bool]] = []
-        for ids, success in episodes:
+        for episode in episodes:
+            ids, success = episode[0], episode[1]
+            domain = episode[2] if len(episode) > 2 else None  # type: ignore[misc]
             for mid in ids:
                 events.append((mid, success))
                 item = by_id.get(mid)
@@ -347,6 +391,8 @@ class ReasoningMemoryBank:
                 item.last_used_generation = generation
                 if success:
                     item.wins += 1
+                if domain is not None:
+                    item.record_domain_usage(domain, success, gamma=gamma)
 
         if self.store is not None and events:
             # The store applies these as atomic increments. Under concurrent
@@ -354,22 +400,77 @@ class ReasoningMemoryBank:
             # up as "the bank stopped improving" rather than as an error.
             self.store.record_usage(events)
 
-    def prune(self, min_uses: int = 4, min_utility: float = 0.34) -> list[MemoryItem]:
+    def prune(
+        self,
+        min_uses: int = 4,
+        min_utility: float = 0.34,
+        domain_conditioned: bool = False,
+        archive: bool = False,
+    ) -> list[MemoryItem]:
         """Drop memories that have had a fair trial and underperformed.
 
         ``min_uses`` is the fairness guard: an item retrieved twice into two
         hard tasks has not been disproven. Returns the removed items.
+
+        ``domain_conditioned=True`` spares an item whose *pooled* utility is
+        below ``min_utility`` if it has proven itself in at least one domain
+        it has data for -- the out-of-domain eviction trap the vault's
+        forgetting analysis names: a rule that is genuinely strong in domain
+        A must not be deleted for failing in unrelated domain B just because
+        the pooled figure blends the two. An item with no domain data (the
+        default for every existing bank) falls back to the plain global
+        check, so this flag changes nothing until something has actually
+        called :meth:`credit_assign` with domains.
+
+        ``archive=True`` moves dropped items to :attr:`archived` instead of
+        deleting them, so :meth:`revive` can bring one back if its domain
+        comes around again. ``archive=False`` (the default) is today's
+        behaviour: gone for good, and told to the store if there is one.
         """
         keep, dropped = [], []
         for item in self.items:
-            if item.uses >= min_uses and item.utility < min_utility:
-                dropped.append(item)
-            else:
+            if item.uses < min_uses:
                 keep.append(item)
+                continue
+            if domain_conditioned and item.domain_stats:
+                survives = max(item.utility_for(d) for d in item.domain_stats) >= min_utility
+            else:
+                survives = item.utility >= min_utility
+            (keep if survives else dropped).append(item)
         self.items = keep
-        if self.store is not None and dropped:
+        if archive:
+            self.archived.extend(dropped)
+        elif self.store is not None and dropped:
             self.store.delete([item.id for item in dropped])
         return dropped
+
+    def revive(self, query: str, k: int = 1, min_similarity: float = 0.5) -> list[MemoryItem]:
+        """Pull up to ``k`` archived items whose text best matches ``query``
+        back into :attr:`items`, and return them.
+
+        The counterpart to an archive-mode :meth:`prune`: a rule that was set
+        aside for looking weak in a domain that has since passed is not lost,
+        just dormant -- this is how it comes back rather than staying
+        permanently forgotten. Archived items are always in-memory only (a
+        store never sees them), so this scores by plain cosine rather than
+        going through the store-backed candidate path :meth:`retrieve` uses.
+        """
+        if not self.archived or k <= 0:
+            return []
+        q_vec = self.embedder.embed_query(query)
+        scored = []
+        for item in self.archived:
+            vec = item.embedding or self.embedder.embed_one(item.embed_text())
+            item.embedding = vec
+            sim = cosine(q_vec, vec)
+            if sim >= min_similarity:
+                scored.append((sim, item))
+        scored.sort(key=lambda t: t[0], reverse=True)
+        revived = [item for _, item in scored[:k]]
+        for item in revived:
+            self.archived.remove(item)
+            self.items.append(item)
+        return revived
 
     # -- prompt rendering --------------------------------------------------
 
@@ -424,9 +525,16 @@ class ReasoningMemoryBank:
     def close(self) -> None:
         if self.store is not None:
             self.store.close()
+        if self.embedder.redis_cache is not None:
+            self.embedder.redis_cache.close()
 
     def __len__(self) -> int:
         return len(self.items)
 
     def __iter__(self):
         return iter(self.items)
+
+
+def _archive_path(path: Path) -> Path:
+    """``memory.jsonl`` -> ``memory.archive.jsonl``, next to it."""
+    return path.with_name(f"{path.stem}.archive{path.suffix}")

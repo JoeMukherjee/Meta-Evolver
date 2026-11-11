@@ -164,6 +164,192 @@ def test_failure_memories_render_as_anti_patterns():
     assert "ANTI-PATTERN" in block
 
 
+# -- Phase 1: domain conditioning, decay, and archive/revive ----------------
+
+
+def test_utility_for_with_no_domain_matches_the_plain_property():
+    m = item(wins=3, uses=5)
+    assert m.utility_for() == m.utility
+    assert m.utility_for(None) == m.utility
+
+
+def test_utility_for_an_untagged_domain_falls_back_to_global():
+    """An item domain conditioning has never been told anything about must
+    behave exactly as if conditioning were off."""
+    m = item(wins=8, uses=10)
+    assert m.utility_for("some-domain-never-recorded") == m.utility
+
+
+def test_record_domain_usage_is_a_second_beta_counter_by_default():
+    m = item()
+    for _ in range(4):
+        m.record_domain_usage("travel", True)
+    m.record_domain_usage("support", False)
+    assert m.utility_for("travel") == (4 + 1) / (4 + 2)
+    assert m.utility_for("support") == (0 + 1) / (1 + 2)
+    # The plain global counters are untouched by domain-only credit.
+    assert m.wins == 0 and m.uses == 0
+
+
+def test_record_domain_usage_gamma_discounts_old_evidence():
+    """gamma<1 means old counts shrink every time a new one is recorded --
+    stale success stops propping up utility forever."""
+    m = item()
+    for _ in range(50):
+        m.record_domain_usage("d", True, gamma=0.9)
+    high = m.utility_for("d")
+    for _ in range(20):
+        m.record_domain_usage("d", False, gamma=0.9)
+    low = m.utility_for("d")
+    assert high > 0.9
+    assert low < high
+    # Discounted evidence recovers from a bad streak far faster than the
+    # ~160 straight failures the undiscounted global counter would need.
+    assert low < 0.5
+
+
+def test_credit_assign_plain_pairs_are_unaffected_by_domain_machinery():
+    """Every existing caller passes 2-tuples; behaviour must be bit-identical
+    to before domain conditioning existed."""
+    bank = ReasoningMemoryBank([item(id="good", lesson="works")])
+    bank.credit_assign([(["good"], True), (["good"], True)])
+    assert bank.items[0].domain_stats == {}
+    assert bank.items[0].wins == 2 and bank.items[0].uses == 2
+
+
+def test_credit_assign_triples_populate_domain_stats_without_a_gamma():
+    bank = ReasoningMemoryBank([item(id="m", lesson="x")])
+    bank.credit_assign([(["m"], True, "travel"), (["m"], False, "support")])
+    assert bank.items[0].domain_stats["travel"] == [1.0, 1.0]
+    assert bank.items[0].domain_stats["support"] == [0.0, 1.0]
+    # Plain counters still accumulate across every episode regardless of domain.
+    assert bank.items[0].wins == 1 and bank.items[0].uses == 2
+
+
+def _seed_specialist() -> ReasoningMemoryBank:
+    bank = ReasoningMemoryBank([item(id="specialist", lesson="travel rule")])
+    for _ in range(6):
+        bank.credit_assign([(["specialist"], True, "travel")])
+    for _ in range(20):
+        bank.credit_assign([(["specialist"], False, "support")])
+    return bank
+
+
+def test_domain_conditioned_prune_spares_an_item_strong_in_one_domain():
+    """The out-of-domain eviction trap: a rule that is genuinely good in
+    'travel' must not be deleted for failing in unrelated 'support' just
+    because the pooled figure blends the two."""
+    bank = _seed_specialist()
+    # Pooled utility is dragged well under the cutoff by the unrelated domain.
+    assert bank.items[0].utility < 0.34
+    assert bank.items[0].utility_for("travel") >= 0.34
+
+    pooled = bank.prune(min_uses=4, min_utility=0.34, domain_conditioned=False)
+    assert [d.id for d in pooled] == ["specialist"]
+
+    conditioned = _seed_specialist().prune(min_uses=4, min_utility=0.34, domain_conditioned=True)
+    assert conditioned == []
+
+
+def test_domain_conditioned_prune_still_drops_an_item_weak_everywhere():
+    bank = ReasoningMemoryBank([item(id="bad", lesson="misleads")])
+    for _ in range(8):
+        bank.credit_assign([(["bad"], False, "any-domain")])
+    dropped = bank.prune(min_uses=4, min_utility=0.34, domain_conditioned=True)
+    assert [d.id for d in dropped] == ["bad"]
+
+
+def test_archive_mode_prune_does_not_delete():
+    bank = ReasoningMemoryBank(
+        [item(id="stale", lesson="connection pool exhausted, raise the limit")]
+    )
+    for _ in range(5):
+        bank.credit_assign([(["stale"], False)])
+
+    dropped = bank.prune(min_uses=4, min_utility=0.34, archive=True)
+    assert [d.id for d in dropped] == ["stale"]
+    assert len(bank) == 0
+    assert len(bank.archived) == 1
+    # archive=True must not touch the store's delete path.
+    assert bank.store is None
+
+
+def test_revive_picks_the_best_lexical_match_and_moves_it_back():
+    # Real fallback embeddings (process-stable, see the first test in this
+    # file), same as every other retrieval-quality test here -- ranking by
+    # relative similarity, not an absolute threshold, matches how
+    # test_utility_weighting_demotes_a_losing_memory already validates this
+    # embedder's behaviour.
+    bank = ReasoningMemoryBank()
+    bank.archived = [
+        item(id="stale", lesson="connection pool exhausted, raise the limit"),
+        item(id="unrelated", lesson="the weather forecast for tomorrow"),
+    ]
+    revived = bank.revive("connection pool exhausted", k=1, min_similarity=0.0)
+    assert [r.id for r in revived] == ["stale"]
+    assert [m.id for m in bank.items] == ["stale"]
+    assert [a.id for a in bank.archived] == ["unrelated"]
+
+
+def test_delete_mode_prune_never_populates_archived():
+    """Default behaviour: archive=False still deletes, exactly as before
+    archive mode existed."""
+    bank = ReasoningMemoryBank([item(id="bad", lesson="misleads")])
+    for _ in range(5):
+        bank.credit_assign([(["bad"], False)])
+    bank.prune(min_uses=4, min_utility=0.34)
+    assert bank.archived == []
+
+
+def test_revive_respects_k():
+    """Even with two equally-plausible matches, no more than k come back."""
+    bank = ReasoningMemoryBank()
+    bank.archived = [
+        item(id="a", lesson="connection pool exhausted"),
+        item(id="b", lesson="connection pool queue depth"),
+    ]
+    revived = bank.revive("connection pool", k=1, min_similarity=0.0)
+    assert len(revived) == 1
+    assert len(bank.archived) == 1  # one left behind by k=1
+
+
+def test_revive_respects_min_similarity():
+    """A precomputed, orthogonal embedding never clears a real threshold."""
+    bank = ReasoningMemoryBank()
+    bank.embedder = _FixedEmbedder([1.0, 0.0, 0.0])
+    far = item(id="far", lesson="unrelated", embedding=[0.0, 1.0, 0.0])
+    bank.archived = [far]
+    assert bank.revive("query", k=5, min_similarity=0.9) == []
+    assert len(bank.archived) == 1
+
+
+def test_archive_and_reload_round_trip_through_a_sidecar_file(tmp_path):
+    path = tmp_path / "memory.jsonl"
+    bank = ReasoningMemoryBank(
+        [item(id="stale", lesson="connection pool exhausted, raise the limit")], path=path
+    )
+    for _ in range(5):
+        bank.credit_assign([(["stale"], False)])
+    bank.prune(min_uses=4, min_utility=0.34, archive=True)
+    bank.save()
+
+    archive_file = tmp_path / "memory.archive.jsonl"
+    assert archive_file.exists()
+
+    reloaded = ReasoningMemoryBank.load(path)
+    assert len(reloaded.items) == 0
+    assert len(reloaded.archived) == 1
+    assert reloaded.archived[0].id == "stale"
+
+
+def test_reload_with_no_archive_file_leaves_archived_empty(tmp_path):
+    path = tmp_path / "memory.jsonl"
+    bank = ReasoningMemoryBank([item(id="a", lesson="x")], path=path)
+    bank.save()
+    reloaded = ReasoningMemoryBank.load(path)
+    assert reloaded.archived == []
+
+
 class _FixedEmbedder(Embedder):
     """Embedder returning one constant query vector."""
 

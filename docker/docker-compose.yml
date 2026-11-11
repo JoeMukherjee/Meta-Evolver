@@ -14,8 +14,13 @@
 # naming only the application database authenticates against the wrong one and
 # fails with a bare "Authentication failed".
 #
-# Ports are deliberately non-default (5433, 27018) so this cannot collide with
-# a Postgres or Mongo you already run.
+# Redis (shared embedding cache) is likewise its own profile:
+#
+#   docker compose -f docker/docker-compose.yml --profile redis up -d
+#   export META_EVOLVER_REDIS_URL=redis://localhost:6380/0
+#
+# Ports are deliberately non-default (5433, 27018, 6380) so this cannot
+# collide with a Postgres, Mongo or Redis you already run.
 
 name: meta-evolver
 
@@ -67,6 +72,36 @@ services:
       start_period: 10s
     restart: unless-stopped
 
+  redis:
+    # Shared, persistent embedding cache: the bank re-embeds the same item
+    # text on every retrieval round, and Embedder's own in-memory dict cache
+    # (see meta_evolver/llm/embeddings.py) is lost between processes -- a
+    # fresh CLI invocation, or scripts/baseline.py's per-arm subprocesses,
+    # currently re-pay every embedding call the previous run already made.
+    # In the `redis` profile because, like Mongo, most runs need only the
+    # default in-memory cache and this is purely an optimisation:
+    #
+    #   docker compose -f docker/docker-compose.yml --profile redis up -d
+    #   export META_EVOLVER_REDIS_URL=redis://localhost:6380/0
+    image: redis:7-alpine
+    container_name: meta-evolver-redis
+    profiles: ["redis"]
+    ports:
+      - "6380:6379"
+    volumes:
+      - redis-data:/data
+    # AOF persistence: an embedding cache is worth keeping across a container
+    # restart (it took real API calls to build), but losing the last second
+    # of writes on a crash is an acceptable trade against every-write fsync.
+    command: ["redis-server", "--appendonly", "yes"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 3s
+    restart: unless-stopped
+
   neo4j:
     # The causal graph of a run: generations, prompts, memories, episodes and
     # the edges between them. In the `graph` profile because it is an
@@ -101,4 +136,5 @@ services:
 volumes:
   postgres-data:
   mongo-data:
+  redis-data:
   neo4j-data:

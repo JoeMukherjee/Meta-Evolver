@@ -27,6 +27,7 @@ from uuid import uuid4
 from langchain_core.language_models.chat_models import BaseChatModel
 
 from meta_evolver.adaptive.controller import AdaptiveControllerConfig
+from meta_evolver.benchmarks.chat import ChatBenchmark, ChatTurnSource, StdinTurnSource
 from meta_evolver.core.aio import LoopRunner
 from meta_evolver.core.registry import get_benchmark
 from meta_evolver.core.types import GenerationReport, Trajectory
@@ -45,6 +46,7 @@ from meta_evolver.storage.checkpoint import (
     thread_id,
 )
 from meta_evolver.telemetry.engine import TelemetryEngine
+from meta_evolver.telemetry.tracer import TelemetryTracer
 
 
 def _memory_checkpointer() -> Any:
@@ -82,6 +84,11 @@ class MetaEvolver:
         run_dir: str | Path | None = None,
         telemetry: bool = True,
         use_memory: bool = True,
+        trace: bool = False,
+        prompt_optimizer: Any = None,
+        tool_proposer: Any = None,
+        tool_router: Any = None,
+        assertion_runner: Any = None,
     ) -> None:
         self.benchmark = get_benchmark(benchmark) if isinstance(benchmark, str) else benchmark
         self.model = chat_model or build_chat_model(
@@ -146,13 +153,57 @@ class MetaEvolver:
         self.telemetry = TelemetryEngine(
             run_dir or Path("runs") / self.benchmark.name, enabled=telemetry
         )
+        # Local, self-hosted span tracing (separate from LangSmith, which
+        # traces every LangChain/LangGraph call automatically once
+        # $LANGSMITH_TRACING is set) -- off by default since most runs don't
+        # need per-node JSON files on disk.
+        self.trace_dir: Path | None = self.telemetry.run_dir / "traces" if trace else None
         self.prompt_template = self.benchmark.system_prompt()
         self.prompt_version = "base"
         self.curriculum_level = 0.0
+        self.rehearsal_ids: list[str] = []
+        """Task ids the current prompt is known to pass -- see
+        ``EvolutionState.rehearsal_ids``. Persisted onto ``self`` after
+        :meth:`evolve` the same way ``prompt_template`` is, so a
+        :class:`~meta_evolver.adapter.MetaAdapter` snapshot can carry a
+        real regression oracle, not just the prompt text on its own."""
+        self.adopted_tools: list[dict[str, Any]] = []
+        """Every tool that cleared both self-modification gates this run --
+        see ``EvolutionState.adopted_tools``. Empty unless ``config.
+        enable_tool_proposals`` is set and the benchmark supports it."""
         self.reports: list[GenerationReport] = []
 
         self._use_memory = use_memory
         self._controller_config = controller_config
+        self._prompt_optimizer = prompt_optimizer
+        self._tool_proposer = tool_proposer
+        self._tool_router = tool_router
+        """Optional :class:`~meta_evolver.tools.routing.ToolRouter`, passed
+        straight through to :func:`~meta_evolver.graphs.episode.
+        build_episode_graph`. ``None`` (the default) is today's behaviour --
+        the agent sees every tool the environment offers, unrouted."""
+        self._assertion_runner = assertion_runner
+        """Optional :class:`~meta_evolver.tools.assertions.AssertionRunner`,
+        passed straight through the same way. ``None`` (the default) runs
+        no in-flight assertions."""
+        """``None`` (default) uses ``build_evolution_graph``'s own default,
+        :class:`~meta_evolver.prompts.optimizer.PromptOptimizer` -- today's
+        monolithic-prompt rewriter. Pass a
+        :class:`~meta_evolver.prompts.gepa.GEPAPromptOptimizer` instance here
+        for component-targeted mutation with a frozen core role instead;
+        every other consumer (the rehearsal gate, the causal-graph recorder)
+        works with either unchanged."""
+        self._replay_screener: Any = None
+        if self.config.replay_screen:
+            from meta_evolver.eval.replay import ReplayScreener
+
+            self._replay_screener = ReplayScreener(
+                embedder=self.embedder, top_k=self.config.replay_top_k
+            )
+        """Constructed automatically from ``config.replay_screen``/
+        ``replay_top_k`` -- reuses this evolver's own embedder, so screening
+        costs nothing beyond what retrieval already pays for. ``None`` (the
+        default, ``replay_screen=False``) skips it entirely."""
         self._checkpoint_cm: Any = None
         # Every sync entry point shares one loop, so a connection pool opened
         # by evolve() is still on a live loop when close() releases it.
@@ -167,6 +218,15 @@ class MetaEvolver:
         self.episode_graph = self._build_episode_graph()
 
     def _build_episode_graph(self) -> Any:
+        context_reducer = None
+        if self.config.context_reducer:
+            from meta_evolver.tools.reducer import EvidenceReducer
+
+            context_reducer = EvidenceReducer(
+                self.model,
+                min_chars=self.config.context_reducer_min_chars,
+                max_output_chars=self.config.context_reducer_max_chars,
+            )
         return build_episode_graph(
             model=self.model,
             bank=self.bank if self._use_memory else None,
@@ -174,6 +234,10 @@ class MetaEvolver:
             retrieval_mode=self.config.retrieval_mode,
             controller_config=self._controller_config,
             checkpointer=self.checkpointer,
+            context_reducer=context_reducer,
+            retrieval_min_similarity=self.config.retrieval_min_similarity,
+            tool_router=self._tool_router,
+            assertion_runner=self._assertion_runner,
         )
 
     async def _ensure_checkpointer(self) -> None:
@@ -226,6 +290,10 @@ class MetaEvolver:
             on_report=_record,
             run_id=self.run_id,
             recorder=self.recorder if self.recorder.enabled else None,
+            trace_dir=self.trace_dir,
+            prompt_optimizer=self._prompt_optimizer,
+            replay_screener=self._replay_screener,
+            tool_proposer=self._tool_proposer,
         )
 
         initial = {
@@ -254,6 +322,8 @@ class MetaEvolver:
         self.prompt_template = final.get("prompt_template", self.prompt_template)
         self.prompt_version = final.get("prompt_version", self.prompt_version)
         self.curriculum_level = float(final.get("curriculum_level", self.curriculum_level))
+        self.rehearsal_ids = list(final.get("rehearsal_ids") or self.rehearsal_ids)
+        self.adopted_tools = self.adopted_tools + list(final.get("adopted_tools") or [])
 
         for trajectory in final.get("trajectories", []):
             self.telemetry.log_episode(trajectory, curriculum_level=self.curriculum_level)
@@ -310,8 +380,13 @@ class MetaEvolver:
                 task_id, curriculum_level=level, seed=self.config.seed
             )
             env = self.curriculum.wrap(env, level=level, seed=self.config.seed)
+            tracer = (
+                TelemetryTracer(task_id=task_id, run_id=self.run_id)
+                if self.trace_dir is not None
+                else None
+            )
             try:
-                return await arun_episode(
+                trajectory = await arun_episode(
                     graph,
                     env=env,
                     task_id=task_id,
@@ -323,7 +398,13 @@ class MetaEvolver:
                     thread_id=thread_id(
                         self.run_id, "evaluate", split, use_memory, task_id
                     ),
+                    tracer=tracer,
                 )
+                if tracer is not None:
+                    tracer.save_to_file(
+                        self.trace_dir / f"evaluate_{split}_{task_id}_{tracer.trace_id}.json"
+                    )
+                return trajectory
             finally:
                 env.close()
 
@@ -350,6 +431,83 @@ class MetaEvolver:
             "tokens": sum(t.tokens for t in trajectories),
             "trajectories": trajectories,
         }
+
+    # -- live chat -----------------------------------------------------------
+
+    def chat(self, *args: Any, **kwargs: Any) -> Trajectory:
+        """Synchronous :meth:`achat`."""
+        return self._loop.run(self.achat(*args, **kwargs))
+
+    async def achat(
+        self,
+        turn_source: ChatTurnSource | None = None,
+        on_reply: Callable[[str], None] | None = None,
+        max_steps: int = 200,
+        session_id: str | None = None,
+    ) -> Trajectory:
+        """Run one live, open-ended conversation through this harness.
+
+        Unlike :meth:`evolve`/:meth:`evaluate`, this does not sweep a task
+        list or score a pass rate -- it runs exactly one long episode against
+        :attr:`benchmark` (which must be a :class:`ChatBenchmark`), driven by
+        real human turns from ``turn_source`` instead of a scripted task. The
+        episode still runs through the same episode graph as any benchmark
+        rollout, so the evolved prompt and the memory bank's retrieval both
+        apply exactly as they do in evaluation -- a chat session and a
+        benchmark episode are the same kind of thing underneath.
+
+        ``max_steps`` bounds total exchanges (each ``send_message`` call is
+        one step), as a safety cap against a runaway loop -- not a target
+        conversation length. Defaults far above a benchmark episode's 15
+        because a live conversation reasonably runs much longer.
+
+        With no ``turn_source``, reads from the terminal
+        (:class:`~meta_evolver.benchmarks.chat.StdinTurnSource`) and prints
+        replies to stdout -- the zero-configuration path for trying a chat
+        session interactively. A server frontend passes its own
+        :class:`~meta_evolver.benchmarks.chat.QueueTurnSource` (or another
+        :class:`~meta_evolver.benchmarks.chat.ChatTurnSource`) and ``on_reply``
+        instead.
+        """
+        if not isinstance(self.benchmark, ChatBenchmark):
+            raise TypeError(
+                "chat() requires a ChatBenchmark; construct MetaEvolver with "
+                "benchmark=ChatBenchmark(...) or benchmark='chat'."
+            )
+        await self._ensure_checkpointer()
+
+        self.benchmark.turn_source = turn_source or StdinTurnSource()
+        self.benchmark.on_reply = on_reply or (lambda text: print(f"Assistant: {text}"))
+
+        task_id = "session"
+        env = self.benchmark.make_env(task_id)
+        tracer = (
+            TelemetryTracer(task_id=task_id, run_id=self.run_id)
+            if self.trace_dir is not None
+            else None
+        )
+        try:
+            trajectory = await arun_episode(
+                self.episode_graph,
+                env=env,
+                task_id=task_id,
+                benchmark=self.benchmark.name,
+                instruction=self.benchmark.instruction_for(task_id),
+                prompt_template=self.prompt_template,
+                prompt_version=self.prompt_version,
+                max_steps=max_steps,
+                thread_id=thread_id(self.run_id, "chat", session_id or "default"),
+                tracer=tracer,
+            )
+            if tracer is not None:
+                tracer.save_to_file(
+                    self.trace_dir / f"chat_{session_id or 'default'}_{tracer.trace_id}.json"
+                )
+        finally:
+            env.close()
+
+        self.telemetry.log_episode(trajectory, curriculum_level=self.curriculum_level)
+        return trajectory
 
     # -- convenience -------------------------------------------------------
 

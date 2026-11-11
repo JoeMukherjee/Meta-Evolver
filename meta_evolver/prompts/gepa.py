@@ -190,6 +190,11 @@ class GEPAPromptOptimizer:
         self.rng = random.Random(seed)
         self.population: list[ParetoCandidate] = []
         self.candidate_counter = 0
+        self.last_error: str = ""
+        """Set on a reflection-call failure, cleared on the next successful
+        ``propose()``. Read by ``evolution.py``'s ``checkpoint`` node exactly
+        like ``PromptOptimizer.last_error`` -- part of what makes this a
+        drop-in replacement rather than a parallel code path."""
 
     def seed_population(self, base_prompt_text: str = BASE_SYSTEM_PROMPT) -> ParetoCandidate:
         """Seed the population with a base prompt."""
@@ -302,7 +307,11 @@ class GEPAPromptOptimizer:
                 ).strip()
                 if reply and len(reply) > 20:
                     setattr(mutated_prompt, target_comp, reply)
-            except Exception:
+            except Exception as exc:
+                # Sticky, like PromptOptimizer.last_error -- set on failure,
+                # never auto-cleared, so a report keeps naming the last real
+                # problem rather than losing it the moment one call recovers.
+                self.last_error = str(exc)
                 # Fallback to local heuristic mutation if reflection call fails
                 heuristic_patch = f"{current_val} Note: When stuck or blocked, inspect state before retrying."
                 setattr(mutated_prompt, target_comp, heuristic_patch)
