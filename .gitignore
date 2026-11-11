@@ -227,3 +227,7 @@ prompt.txt
 
 # Generated figure drafts and previews (regenerate with scripts/)
 docs/figures/drafts/
+
+# Local Obsidian knowledge vault
+vault/
+vault.rar
