@@ -20,7 +20,7 @@ from meta_evolver.llm.client import ScriptedChatModel, tool_call_message  # noqa
 
 
 @pytest.fixture(autouse=True)
-def _hermetic_backends(monkeypatch):
+def _hermetic_backends(monkeypatch, tmp_path_factory):
     """Keep tests off whatever databases the developer's local ``.env`` points at.
 
     ``meta_evolver`` loads ``.env`` at import time, so a machine configured for
@@ -34,6 +34,8 @@ def _hermetic_backends(monkeypatch):
         "META_EVOLVER_REDIS_URL",
     ):
         monkeypatch.delenv(var, raising=False)
+    # Never let a developer's real spend ledger guard (or be written by) a test.
+    monkeypatch.setenv("META_EVOLVER_SPEND_LEDGER", str(tmp_path_factory.getbasetemp() / "no-ledger.json"))
 
 
 def tools_used(messages) -> set[str]:

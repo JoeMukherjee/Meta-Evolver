@@ -290,6 +290,12 @@ def build_chat_model(
         kwargs.setdefault("rate_limiter", limiter)
 
     init_kwargs: dict[str, Any] = {"max_retries": max_retries, **kwargs}
+    # Every model is covered by the persistent spend ledger when one exists.
+    from meta_evolver.llm.budget import BudgetGuard, default_ledger
+
+    ledger = default_ledger()
+    if ledger is not None and "callbacks" not in init_kwargs:
+        init_kwargs["callbacks"] = [BudgetGuard(ledger)]
     if timeout is not None:
         init_kwargs.setdefault("timeout", timeout)
     if provider:
