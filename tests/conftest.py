@@ -19,6 +19,23 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from meta_evolver.llm.client import ScriptedChatModel, tool_call_message  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _hermetic_backends(monkeypatch):
+    """Keep tests off whatever databases the developer's local ``.env`` points at.
+
+    ``meta_evolver`` loads ``.env`` at import time, so a machine configured for
+    Postgres/Mongo/Neo4j/Redis would otherwise make every test that builds a
+    ``MetaEvolver`` try to connect to it (and fail or stall when it is down).
+    Tests that exercise a backend set the variable themselves.
+    """
+    for var in (
+        "META_EVOLVER_DB_URL",
+        "META_EVOLVER_GRAPH_URL",
+        "META_EVOLVER_REDIS_URL",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+
 def tools_used(messages) -> set[str]:
     """Names of every tool call already made in a transcript."""
     used: set[str] = set()

@@ -24,6 +24,7 @@ _BUILTIN_MODULES = (
     "meta_evolver.benchmarks.chat",
     "meta_evolver.benchmarks.longmemeval",
     "meta_evolver.benchmarks.locomo",
+    "meta_evolver.benchmarks.wandr",
 )
 
 T = TypeVar("T", bound=type)
