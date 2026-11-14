@@ -261,3 +261,13 @@ def test_no_memory_arm_learns_nothing(tmp_path):
     rows = json.loads(target.read_text(encoding="utf-8"))["rows"]
     assert rows[0]["train_tokens"] == 0
     assert rows[0]["memories"] == 0
+
+
+def test_extra_arms_for_the_graph_and_skill_layers_are_known_and_summarised():
+    from meta_evolver.eval.baseline import ALL_ARMS, ARMS, EXTRA_ARMS, summarize
+
+    assert ARMS == ("no_memory", "bank_only", "bank_evolve")  # the original three are unchanged
+    assert set(EXTRA_ARMS) == {"bank_graph", "bank_graph_skills", "bank_graph_lift"}
+    rows = [{"arm": a, "seed": 0, "pass_rate": 0.5, "avg_score": 0.5, "train_tokens": 1, "eval_tokens": 1}
+            for a in ALL_ARMS]
+    assert set(summarize(rows)) == set(ALL_ARMS)

@@ -41,6 +41,11 @@ from meta_evolver.graphs.evolution import EvolutionConfig
 
 ARMS: tuple[str, ...] = ("no_memory", "bank_only", "bank_evolve")
 
+#: Arms for the knowledge-graph and skill layers, each ``bank_only`` plus one
+#: capability, so a difference against ``bank_only`` is attributable to it.
+EXTRA_ARMS: tuple[str, ...] = ("bank_graph", "bank_graph_skills", "bank_graph_lift")
+ALL_ARMS: tuple[str, ...] = ARMS + EXTRA_ARMS
+
 
 def _category(trajectory: Trajectory) -> str:
     """The benchmark's own label for a task, wherever its adapter put it."""
@@ -90,11 +95,12 @@ def run_arm(
     max_total_tokens: int | None,
     run_dir: Path,
     trace: bool = True,
+    tasks_per_generation: int = 0,
 ) -> dict[str, Any]:
     """One arm, one seed. Fresh benchmark, model and bank every time, so no
     arm inherits anything another arm learned."""
-    if arm not in ARMS:
-        raise ValueError(f"unknown arm {arm!r}; expected one of {ARMS}")
+    if arm not in ALL_ARMS:
+        raise ValueError(f"unknown arm {arm!r}; expected one of {ALL_ARMS}")
 
     bench = benchmark_factory()
     model = model_factory()
@@ -108,7 +114,18 @@ def run_arm(
         optimize_prompt=(arm == "bank_evolve"),
         seed=seed,
         max_total_tokens=max_total_tokens,
+        tasks_per_generation=tasks_per_generation,
     )
+    learner = None
+    if arm in EXTRA_ARMS:
+        from meta_evolver.learning import GenerationLearner
+
+        learner = GenerationLearner.default(
+            run_dir / f"seed{seed}" / arm / "learner",
+            graph=True,
+            skills=arm == "bank_graph_skills",
+            lift=arm == "bank_graph_lift",
+        )
     started = time.time()
     evolver = MetaEvolver(
         benchmark=bench,
@@ -117,6 +134,7 @@ def run_arm(
         run_dir=run_dir / f"seed{seed}" / arm,
         use_memory=(arm != "no_memory"),
         trace=trace,
+        learner=learner,
     )
     try:
         train_tokens = 0
@@ -151,7 +169,7 @@ def summarize(rows: Sequence[dict[str, Any]]) -> dict[str, dict[str, float]]:
     improvement smaller than this is not yet an improvement.
     """
     out: dict[str, dict[str, float]] = {}
-    for arm in ARMS:
+    for arm in ALL_ARMS:
         mine = [r for r in rows if r["arm"] == arm]
         if not mine:
             continue
@@ -183,6 +201,8 @@ def run_baseline(
     out_dir: str | Path = "results",
     trace: bool = True,
     on_row: Callable[[dict[str, Any]], None] | None = None,
+    tasks_per_generation: int = 0,
+    token_ceiling: int | None = None,
 ) -> Path:
     """Run every (seed, arm) pair and write ``<out_dir>/<bench>/<sha>.json``.
 
@@ -197,6 +217,12 @@ def run_baseline(
     rows: list[dict[str, Any]] = []
     for seed in seeds:
         for arm in arms:
+            # A spending guard, not a statistic: once the run has used its approved
+            # token total, no further arm starts. (It cannot interrupt an arm
+            # mid-flight; ``max_total_tokens`` bounds each arm's training.)
+            spent = sum(r["train_tokens"] + r["eval_tokens"] for r in rows)
+            if token_ceiling is not None and spent >= token_ceiling:
+                break
             row = run_arm(
                 arm,
                 benchmark_factory,
@@ -207,6 +233,7 @@ def run_baseline(
                 max_total_tokens=max_total_tokens,
                 run_dir=target_dir / f"{sha}_runs",
                 trace=trace,
+                tasks_per_generation=tasks_per_generation,
             )
             rows.append(row)
             if on_row is not None:

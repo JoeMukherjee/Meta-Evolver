@@ -38,6 +38,8 @@ def main(
     arms: str = typer.Option(",".join(ARMS), help="Comma-separated arms to run."),
     generations: int = typer.Option(2, help="Training generations for the learning arms."),
     max_steps: int = typer.Option(15),
+    token_ceiling: int | None = typer.Option(None, help="Stop starting new arms once this many tokens are spent in total."),
+    tasks_per_generation: int = typer.Option(0, help="Cap training tasks per generation (0 = all). The main lever on training cost."),
     max_total_tokens: int | None = typer.Option(None, help="Per-arm training token budget."),
     requests_per_second: float | None = typer.Option(None, help="Throttle model calls."),
     out_dir: Path = typer.Option(Path("results")),
@@ -76,6 +78,8 @@ def main(
         out_dir=out_dir,
         trace=not no_trace,
         on_row=show,
+        tasks_per_generation=tasks_per_generation,
+        token_ceiling=token_ceiling,
     )
 
     import json

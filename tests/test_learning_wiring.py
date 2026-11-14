@@ -133,3 +133,13 @@ def test_skill_library_persists_across_runs(tmp_path):
     _evolver(learner).evolve(generations=1)
     again = SkillLibrary(tmp_path / "skills.json")
     assert any(s.signature == "lookup>answer" for s in again.skills.values())
+
+
+def test_lifting_is_opt_in_and_wires_through_the_learner():
+    off = GenerationLearner.default()
+    assert off.lift is False and off.graph_memory.transfer is False
+
+    on = GenerationLearner.default(lift=True)
+    assert on.lift is True and on.graph_memory.transfer is True
+    _evolver(on).evolve(generations=1)
+    assert on.errors == [] and "lift" in on.history[-1]

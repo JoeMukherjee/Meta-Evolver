@@ -41,9 +41,12 @@ class Recommendation:
 
 
 class GraphMemory:
-    def __init__(self, graph: KnowledgeGraph, min_confidence: float = 0.4) -> None:
+    def __init__(self, graph: KnowledgeGraph, min_confidence: float = 0.4, transfer: bool = False) -> None:
         self.graph = graph
         self.min_confidence = min_confidence
+        self.transfer = transfer
+        """Default for :meth:`recommend`'s ``transfer``: lets a run opt in to
+        concept-lifting transfer once, at construction."""
 
     def _degree(self, nid: str) -> int:
         """Degree over *asserted* edges only. Inferred (lifted) and derived
@@ -59,7 +62,7 @@ class GraphMemory:
         domain: str = "",
         exclude: Iterable[str] = (),
         k: int = 4,
-        transfer: bool = False,
+        transfer: bool | None = None,
         transfer_decay: float = 0.5,
         transfer_hops: int = 2,
     ) -> list[Recommendation]:
@@ -70,6 +73,7 @@ class GraphMemory:
         borrowed score by ``transfer_decay`` and by that link's confidence, so
         borrowed evidence always ranks below the same evidence held directly."""
         g = self.graph
+        transfer = self.transfer if transfer is None else transfer
         skip = {node_id("Memory", x) for x in exclude} | {node_id("Skill", x) for x in exclude}
         scores: dict[str, float] = {}
         why: dict[str, list[str]] = {}

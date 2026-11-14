@@ -42,12 +42,18 @@ class GenerationLearner:
         ontology: Ontology | None = None,
         repair_every: int = 1,
         mine_skills: bool = True,
+        lift: bool = False,
     ) -> None:
         self.graph = graph
         self.skills = skills
         self.ontology = ontology or agent_ontology()
         self.ingestor = GraphIngestor(graph, self.ontology) if graph is not None else None
-        self.graph_memory = GraphMemory(graph) if graph is not None else None
+        self.lift = lift
+        """Opt-in: induce ``similar_to``/``is_a`` links between concepts each
+        generation and let retrieval transfer evidence across them. Off by
+        default -- it is only worth enabling where an OOD recall measurement
+        says it helps."""
+        self.graph_memory = GraphMemory(graph, transfer=lift) if graph is not None else None
         self.repair_every = repair_every
         self.mine_skills = mine_skills
         self.errors: list[str] = []
@@ -60,6 +66,7 @@ class GenerationLearner:
         embed: Any = None,
         graph: bool = True,
         skills: bool = True,
+        lift: bool = False,
     ) -> "GenerationLearner":
         """Graph and skill library persisted under ``directory`` (in memory if
         ``None``), ready to hand to :class:`~meta_evolver.core.evolver.MetaEvolver`."""
@@ -67,6 +74,7 @@ class GenerationLearner:
         return cls(
             graph=KnowledgeGraph(d / "knowledge.sqlite" if d else None) if graph else None,
             skills=SkillLibrary(d / "skills.json" if d else None, embed=embed) if skills else None,
+            lift=lift,
         )
 
     # -- hooks ---------------------------------------------------------------
@@ -94,6 +102,11 @@ class GenerationLearner:
         if self.ingestor is not None:
             try:
                 out["graph"] = self.ingestor.ingest(this_gen, generation)
+                if self.lift:
+                    from meta_evolver.knowledge import induce_concept_links
+
+                    rep = induce_concept_links(self.graph, generation)
+                    out["lift"] = {k: v for k, v in vars(rep).items() if isinstance(v, int)}
                 if self.repair_every > 0 and (generation + 1) % self.repair_every == 0:
                     report = repair(self.graph, self.ontology, generation=generation)
                     out["repair"] = {"fixed": report.fixed, "unresolved": len(report.unresolved)}
