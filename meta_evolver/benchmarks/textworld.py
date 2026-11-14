@@ -119,8 +119,17 @@ class TextGameEnv(ActionableEnv):
         )
     ]
 
-    def __init__(self, task_id: str = "kitchen_knife_id", max_steps: int = 25, seed: int = 0):
-        self.task_id = task_id if task_id in LAYOUTS else "kitchen_knife_id"
+    def __init__(
+        self,
+        task_id: str = "kitchen_knife_id",
+        max_steps: int = 25,
+        seed: int = 0,
+        layouts: dict[str, dict[str, Any]] | None = None,
+    ):
+        # ``layouts`` lets a procedural benchmark supply its own table; the
+        # default is the hand-written one, so existing behaviour is unchanged.
+        self.layouts = layouts if layouts is not None else LAYOUTS
+        self.task_id = task_id if task_id in self.layouts else "kitchen_knife_id"
         self.max_steps = int(max_steps)
         self.seed = int(seed)
         self.layout: dict[str, Any] = {}
@@ -134,7 +143,7 @@ class TextGameEnv(ActionableEnv):
         self._reset_state()
 
     def _reset_state(self) -> None:
-        self.layout = dict(LAYOUTS[self.task_id])
+        self.layout = dict(self.layouts[self.task_id])
         # Receptacle order is shuffled per seed so an agent cannot memorize a
         # position in the list instead of learning to search.
         receptacles = list(self.layout["receptacles"])
@@ -153,7 +162,7 @@ class TextGameEnv(ActionableEnv):
     def reset(self, seed=None, options=None) -> EnvResetResponse:
         opts = options or {}
         requested = opts.get("task_id")
-        if requested in LAYOUTS:
+        if requested in self.layouts:
             self.task_id = requested
         if seed is not None:
             self.seed = int(seed)
