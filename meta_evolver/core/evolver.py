@@ -89,6 +89,7 @@ class MetaEvolver:
         tool_proposer: Any = None,
         tool_router: Any = None,
         assertion_runner: Any = None,
+        learner: Any = None,
     ) -> None:
         self.benchmark = get_benchmark(benchmark) if isinstance(benchmark, str) else benchmark
         self.model = chat_model or build_chat_model(
@@ -183,6 +184,10 @@ class MetaEvolver:
         build_episode_graph`. ``None`` (the default) is today's behaviour --
         the agent sees every tool the environment offers, unrouted."""
         self._assertion_runner = assertion_runner
+        self.learner = learner
+        """Optional :class:`~meta_evolver.learning.GenerationLearner` -- the
+        knowledge graph and skill library. ``None`` (default) leaves the engine
+        exactly as it was."""
         """Optional :class:`~meta_evolver.tools.assertions.AssertionRunner`,
         passed straight through the same way. ``None`` (the default) runs
         no in-flight assertions."""
@@ -238,6 +243,8 @@ class MetaEvolver:
             retrieval_min_similarity=self.config.retrieval_min_similarity,
             tool_router=self._tool_router,
             assertion_runner=self._assertion_runner,
+            graph_memory=getattr(self.learner, "graph_memory", None),
+            skill_library=getattr(self.learner, "skills", None),
         )
 
     async def _ensure_checkpointer(self) -> None:
@@ -294,6 +301,7 @@ class MetaEvolver:
             prompt_optimizer=self._prompt_optimizer,
             replay_screener=self._replay_screener,
             tool_proposer=self._tool_proposer,
+            learner=self.learner,
         )
 
         initial = {

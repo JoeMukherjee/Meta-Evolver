@@ -42,8 +42,11 @@ from meta_evolver.core.types import (
 from meta_evolver.graphs.episode import build_episode_graph, run_episode
 from meta_evolver.graphs.evolution import EvolutionConfig, build_evolution_graph
 from meta_evolver.harness.curriculum import Curriculum
+from meta_evolver.knowledge import KnowledgeGraph
+from meta_evolver.learning import GenerationLearner
 from meta_evolver.llm.client import ScriptedChatModel, build_chat_model, tool_call_message
 from meta_evolver.memory.bank import ReasoningMemoryBank
+from meta_evolver.skills import SkillLibrary
 
 __version__ = "0.2.0"
 
@@ -57,12 +60,15 @@ __all__ = [
     "EnvHarness",
     "EvaluationResult",
     "EvolutionConfig",
+    "GenerationLearner",
     "GenerationReport",
+    "KnowledgeGraph",
     "MemoryItem",
     "MetaEvolver",
     "Observation",
     "ReasoningMemoryBank",
     "Rules",
+    "SkillLibrary",
     "ScriptedChatModel",
     "StepRecord",
     "TaskSpec",

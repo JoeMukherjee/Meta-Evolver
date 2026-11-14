@@ -1,0 +1,41 @@
+"""A knowledge-graph layer for out-of-distribution recall and self-repair."""
+from meta_evolver.knowledge.graph import Edge, KnowledgeGraph, Node, node_id, slug
+from meta_evolver.knowledge.ingest import (
+    GraphIngestor,
+    action_verb,
+    extract_concepts,
+    failure_signature,
+)
+from meta_evolver.knowledge.ontology import (
+    Ontology,
+    RelationSpec,
+    RepairReport,
+    Violation,
+    agent_ontology,
+    health,
+    repair,
+    validate,
+)
+from meta_evolver.knowledge.retrieval import GraphMemory, Recommendation
+
+__all__ = [
+    "Edge",
+    "GraphIngestor",
+    "GraphMemory",
+    "KnowledgeGraph",
+    "Node",
+    "Ontology",
+    "Recommendation",
+    "RelationSpec",
+    "RepairReport",
+    "Violation",
+    "action_verb",
+    "agent_ontology",
+    "extract_concepts",
+    "failure_signature",
+    "health",
+    "node_id",
+    "repair",
+    "slug",
+    "validate",
+]

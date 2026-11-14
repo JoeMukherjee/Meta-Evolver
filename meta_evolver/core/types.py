@@ -147,6 +147,12 @@ class Trajectory(BaseModel):
     retrieved_memory_ids: list[str] = Field(default_factory=list)
     """Which memories were in the prompt. The credit-assignment pass reads
     this to decide which memories actually earn their retrieval slot."""
+    retrieved_skill_ids: list[str] = Field(default_factory=list)
+    """Which skills were in the prompt. Kept apart from
+    :attr:`retrieved_memory_ids` because skills are credited by the skill
+    library, not the memory bank -- mixing the ids would make the bank's
+    credit pass (and a database-backed store's usage counters) try to
+    increment records that do not exist there."""
     memory_evicted_at: int | None = None
     prompt_version: str = "base"
     generation: int = 0

@@ -62,6 +62,22 @@ _SPLIT_FILES = {"test": "test.jsonl", "smoke": "smoke.jsonl"}
 MAX_FILE_BYTES = 2_000_000
 
 
+WANDR_SYSTEM_PROMPT = """\
+You are a research agent solving a wide-and-deep research task. The deliverable is
+FILES in your workspace, written with write_file -- not a chat answer.
+
+How to work:
+1. Read the instruction once and list every required output file and its schema before searching.
+2. The task is a tree: a root deliverable plus sidecar subtasks over overlapping entities. Resolve each
+   entity once and reuse it across files; the same entity must have the same identifier everywhere.
+3. Go wide first (find all candidate entities), then deep (enrich and verify each). Do not stop at the first
+   few results.
+4. Every claim needs a source URL you actually opened. No evidence, no row.
+5. Deduplicate entities (name variants, aliases) before writing. Write well-formed JSON/JSONL/CSV.
+6. Write all required files, check them with list_files/read_file, then call finish.
+"""
+
+
 class WandrTask:
     """One WANDR task row (only the fields the engine needs)."""
 
@@ -290,6 +306,11 @@ class WandrBenchmark(BenchmarkAdapter):
         if task is None:
             raise KeyError(f"unknown task_id {task_id!r}")
         return WandrEnv(task)
+
+    def system_prompt(self) -> str:
+        """Starting prompt: just the parts of the WANDR contract an agent cannot
+        infer. Kept short on purpose -- the optimizer specialises it from evidence."""
+        return WANDR_SYSTEM_PROMPT
 
     def instruction_for(self, task_id: str) -> str:
         task = self._tasks.get(task_id)

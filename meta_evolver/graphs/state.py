@@ -116,6 +116,7 @@ class EpisodeState(TypedDict, total=False):
 
     # -- outputs -----------------------------------------------------------
     retrieved_memory_ids: list[str]
+    retrieved_skill_ids: list[str]
     trajectory: Trajectory | None
 
 

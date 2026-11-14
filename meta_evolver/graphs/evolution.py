@@ -245,6 +245,7 @@ def build_evolution_graph(
     prompt_optimizer: Any = None,
     replay_screener: Any = None,
     tool_proposer: Any = None,
+    learner: Any = None,
 ):
     """Compile the evolution graph.
 
@@ -256,6 +257,10 @@ def build_evolution_graph(
     written to as each generation completes rather than at the end, so the
     graph is watchable while the run happens -- and it can never fail a run:
     every write there is guarded.
+
+    ``learner`` is an optional :class:`~meta_evolver.learning.GenerationLearner`
+    -- the knowledge graph and skill library. It is called once after credit
+    and once after prune, and can never fail a run.
 
     ``trace_dir`` opts every episode this graph runs -- training rollouts and
     validation rollouts alike, since both funnel through the same internal
@@ -432,6 +437,8 @@ def build_evolution_graph(
             if t.generation == generation and t.usable
         ]
         bank.credit_assign(triples, generation=generation, gamma=cfg.utility_decay)
+        if learner is not None:
+            learner.credit(state.get("trajectories", []), generation, gamma=cfg.utility_decay)
         return {}
 
     async def prune(state: EvolutionState) -> dict[str, Any]:
@@ -463,6 +470,9 @@ def build_evolution_graph(
             consolidated = len(merged)
             if recorder is not None and merged:
                 recorder.record_pruned(merged, generation=generation)
+
+        if learner is not None:
+            learner.learn(state.get("trajectories", []), generation)
 
         if bank.path is not None:
             bank.save()

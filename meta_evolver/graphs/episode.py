@@ -107,12 +107,23 @@ def build_episode_graph(
     max_history_messages: int | None = DEFAULT_MAX_HISTORY_MESSAGES,
     context_reducer: Any = None,
     retrieval_min_similarity: float = 0.0,
+    graph_memory: Any = None,
+    skill_library: Any = None,
+    graph_k: int = 2,
+    skill_k: int = 2,
 ):
     """Compile the episode graph.
 
     Live handles -- the chat model, the bank -- are closed over rather than
     placed in state: they are not serializable, and a checkpointer would choke
     on them.
+
+    ``graph_memory`` (a :class:`~meta_evolver.knowledge.retrieval.GraphMemory`)
+    adds up to ``graph_k`` bank memories found by *structure* -- shared
+    concepts, an earlier failure on this very task -- on top of the
+    similarity retrieval, which is what rescues an out-of-distribution task
+    worded unlike anything seen. ``skill_library`` adds up to ``skill_k``
+    skills. Both are additive: with neither set, behaviour is unchanged.
 
     ``tool_router`` is optional. Supply one when the environment exposes a
     large registry and most of it is irrelevant to any single task; without it
@@ -176,7 +187,34 @@ def build_episode_graph(
                     min_similarity=retrieval_min_similarity,
                 )
 
-            controller = AdaptiveExplorationController(memories=retrieved, config=cfg)
+            skills_used: list[Any] = []
+            if bank is not None and graph_memory is not None and graph_k > 0:
+                try:
+                    have = {m.id for m in retrieved}
+                    by_id = {m.id: m for m in bank.items}
+                    recs = graph_memory.recommend(
+                        instruction,
+                        task_id=task_id,
+                        domain=state.get("benchmark", ""),
+                        exclude=have,
+                        k=graph_k,
+                    )
+                    retrieved = [*retrieved, *[by_id[r.ref] for r in recs if r.kind == "Memory" and r.ref in by_id]]
+                except Exception:  # an optional layer may never fail an episode
+                    pass
+            if skill_library is not None and skill_k > 0:
+                try:
+                    skills_used = skill_library.retrieve(
+                        f"{instruction}\n{obs.text}"[:2000],
+                        k=skill_k,
+                        domain=state.get("benchmark", "") or None,
+                    )
+                except Exception:
+                    skills_used = []
+
+            controller = AdaptiveExplorationController(
+                memories=[*retrieved, *[s.as_memory_item() for s in skills_used]], config=cfg
+            )
             controller.record_candidates(_admissible(obs))
             runtime.controller = controller
 
@@ -185,6 +223,7 @@ def build_episode_graph(
                 "observation": obs.text[:observation_chars],
                 "admissible": _admissible(obs),
                 "retrieved_memory_ids": [m.id for m in retrieved],
+                "retrieved_skill_ids": [s.id for s in skills_used],
                 "messages": [
                     HumanMessage(
                         content=(
@@ -449,6 +488,7 @@ def build_episode_graph(
                 metrics=metrics,
                 error=error,
                 retrieved_memory_ids=list(state.get("retrieved_memory_ids") or []),
+                retrieved_skill_ids=list(state.get("retrieved_skill_ids") or []),
                 memory_evicted_at=getattr(controller, "eviction_step", None),
                 prompt_version=state.get("prompt_version", "base"),
                 generation=int(state.get("generation", 0)),
