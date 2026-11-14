@@ -49,6 +49,13 @@ class Skill(BaseModel):
     """Set when a promoted child version replaces this skill. Retiring a skill
     always leaves a pointer to what replaced it, so nothing is a dead end."""
     merged_into: str | None = None
+    avoid_when: list[str] = Field(default_factory=list)
+    """Concepts that, when present in a task, mean this skill has been seen to
+    fail: a *negative* precondition learned from its own failures."""
+    outcomes: list[tuple[list[str], bool]] = Field(default_factory=list)
+    """``(task concepts, success)`` for the most recent episodes that used the
+    skill (capped). This is the evidence :meth:`SkillLibrary.refine` reads to
+    separate the situations a skill wins in from the ones it fails in."""
     locked: bool = False
     """A locked skill is never changed by an autonomous actor."""
     patch_count: int = 0
@@ -97,8 +104,11 @@ class Skill(BaseModel):
         return min(1.0, self.utility + z * self._beta_sd())
 
     def record(self, success: bool, task_id: str = "", domain: str | None = None,
-               generation: int = 0, gamma: float = 1.0, cap: int = 50) -> None:
+               generation: int = 0, gamma: float = 1.0, cap: int = 50,
+               concepts: list[str] | None = None, outcome_cap: int = 60) -> None:
         self.uses += 1
+        if concepts is not None:
+            self.outcomes = [*self.outcomes, (list(concepts), bool(success))][-outcome_cap:]
         self.last_used_generation = generation
         if success:
             self.wins += 1

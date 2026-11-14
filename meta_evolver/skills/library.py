@@ -254,12 +254,71 @@ class SkillLibrary:
         self.save()
         return skill
 
+    # -- precondition refinement --------------------------------------------------
+
+    def refine(
+        self,
+        generation: int = 0,
+        actor: str = "refiner",
+        min_outcomes: int = 5,
+        min_failures: int = 2,
+        avoid_rate: float = 0.6,
+        require_rate: float = 0.6,
+        max_new: int = 3,
+    ) -> list[dict]:
+        """Learn *when* a skill works by contrasting its wins with its failures.
+
+        A concept present in most of a skill's failures and in almost none of
+        its wins becomes a negative precondition (``avoid_when``); a concept in
+        most wins and almost no failures becomes a positive one
+        (``when_to_use``). Both need real counts -- ``min_failures`` failures
+        and ``min_outcomes`` episodes -- so one bad episode never teaches a
+        rule. Edits go through the guarded, audited :meth:`patch` path, so each
+        refinement is attributable and reversible, and the pass is idempotent:
+        a skill whose preconditions already match its evidence is left alone.
+        """
+        changes: list[dict] = []
+        for s in self.skills.values():
+            if s.status == "deprecated" or s.locked or len(s.outcomes) < min_outcomes:
+                continue  # a locked skill is skipped, never allowed to abort the pass
+            wins = [set(c) for c, ok in s.outcomes if ok]
+            fails = [set(c) for c, ok in s.outcomes if not ok]
+            if len(fails) < min_failures:
+                continue
+            seen = set().union(*wins, *fails) if (wins or fails) else set()
+            avoid, require = [], []
+            for c in sorted(seen):
+                w = sum(c in x for x in wins) / len(wins) if wins else 0.0
+                f = sum(c in x for x in fails) / len(fails)
+                n_fail = sum(c in x for x in fails)
+                if f >= avoid_rate and w <= 0.1 and n_fail >= min_failures and c not in s.avoid_when:
+                    avoid.append(c)
+                elif wins and w >= require_rate and f <= 0.2 and c not in s.when_to_use:
+                    require.append(c)
+            avoid, require = avoid[:max_new], require[:max_new]
+            if not (avoid or require):
+                continue
+            self.view(s.id, actor)
+            self.patch(
+                s.id,
+                actor=actor,
+                generation=generation,
+                when_to_use=[*s.when_to_use, *require] if require else None,
+            )
+            if avoid:  # patch() has no avoid_when argument by design: preconditions are set here
+                s.avoid_when = [*s.avoid_when, *avoid]
+                self.save()
+            changes.append({"skill": s.id, "avoid_added": avoid, "require_added": require})
+        return changes
+
     # -- retrieval -----------------------------------------------------------
 
     def _relevance(self, skill: Skill, query: str, q_vec: list[float] | None) -> float:
         if q_vec is not None and skill.embedding:
             return max(0.0, cosine(q_vec, skill.embedding))
         want = set(extract_concepts(query, limit=30))
+        if skill.avoid_when and want & set(skill.avoid_when):
+            return 0.0  # a learned negative precondition: this skill has failed here
         if skill.when_to_use:
             # Precondition coverage: what fraction of the skill's own trigger
             # concepts does this task meet? Jaccard would punish a long
@@ -296,17 +355,24 @@ class SkillLibrary:
 
     def credit(
         self,
-        episodes: Iterable[tuple[Sequence[str], bool, str | None, str]],
+        episodes: Iterable[tuple],
         generation: int = 0,
         gamma: float = 1.0,
     ) -> int:
-        """``(skill_ids, success, domain, task_id)`` per episode."""
+        """``(skill_ids, success, domain, task_id[, concepts])`` per episode.
+
+        The optional fifth element is the task's concept words; supplying it is
+        what lets :meth:`refine` learn *when* a skill fails, not just that it does.
+        """
         n = 0
-        for ids, success, domain, task_id in episodes:
+        for ep in episodes:
+            ids, success, domain, task_id = ep[:4]
+            concepts = ep[4] if len(ep) > 4 else None
             for sid in ids:
                 s = self.skills.get(sid)
                 if s is not None:
-                    s.record(success, task_id=task_id, domain=domain, generation=generation, gamma=gamma)
+                    s.record(success, task_id=task_id, domain=domain, generation=generation,
+                             gamma=gamma, concepts=concepts)
                     n += 1
         return n
 

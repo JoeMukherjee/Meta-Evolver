@@ -6,6 +6,12 @@ from meta_evolver.knowledge.ingest import (
     extract_concepts,
     failure_signature,
 )
+from meta_evolver.knowledge.lifting import (
+    LiftReport,
+    induce_concept_links,
+    retract_lifted,
+    winning_sets,
+)
 from meta_evolver.knowledge.ontology import (
     Ontology,
     RelationSpec,
@@ -16,9 +22,29 @@ from meta_evolver.knowledge.ontology import (
     repair,
     validate,
 )
+from meta_evolver.knowledge.reasoner import (
+    DEFAULT_CHAINS,
+    Explanation,
+    PropertyChain,
+    ReasonReport,
+    explain,
+    reason,
+    retract_derived,
+)
 from meta_evolver.knowledge.retrieval import GraphMemory, Recommendation
 
 __all__ = [
+    "DEFAULT_CHAINS",
+    "Explanation",
+    "LiftReport",
+    "PropertyChain",
+    "ReasonReport",
+    "explain",
+    "induce_concept_links",
+    "reason",
+    "retract_derived",
+    "retract_lifted",
+    "winning_sets",
     "Edge",
     "GraphIngestor",
     "GraphMemory",

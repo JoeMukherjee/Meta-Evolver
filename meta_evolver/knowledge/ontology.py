@@ -40,6 +40,9 @@ class RelationSpec:
     functional: bool = False  # at most one active target per source
     acyclic: bool = False  # no directed cycles (is_a, supersedes)
     symmetric: bool = False
+    # Name of the converse relation (``mitigated_by`` <-> ``mitigates``). The
+    # reasoner uses it to derive the reverse edge; validation ignores it.
+    inverse: str | None = None
 
 
 def _rel(domain=(), range=(), **kw) -> RelationSpec:
@@ -90,7 +93,12 @@ def agent_ontology() -> Ontology:
             # tasks touching this concept/domain. Out-of-distribution retrieval
             # walks it.
             "applies_to": _rel(learnable, ["Concept", "Domain", "Tool"]),
-            "mitigated_by": _rel(["FailureMode"], list(learnable)),
+            "mitigated_by": _rel(["FailureMode"], list(learnable), inverse="mitigates"),
+            "mitigates": _rel(learnable, ["FailureMode"], inverse="mitigated_by"),
+            # Induced by ``lifting`` (from evidence) / derived by ``reasoner``
+            # (from rules); both are marked in edge props and invalidatable.
+            "similar_to": _rel(["Concept"], ["Concept"], symmetric=True),
+            "related_to": _rel(["FailureMode"], ["Concept"]),
             "uses_tool": _rel(["Skill"], ["Tool"]),
             "derived_from": _rel(["Skill", "Memory"], ["Episode"]),
             "supersedes": _rel(["Skill"], ["Skill"], acyclic=True),

@@ -27,6 +27,7 @@ from meta_evolver.knowledge import (
     KnowledgeGraph,
     Ontology,
     agent_ontology,
+    extract_concepts,
     health,
     repair,
 )
@@ -76,7 +77,8 @@ class GenerationLearner:
         try:
             self.skills.credit(
                 [
-                    (t.retrieved_skill_ids, t.success, t.benchmark or None, t.task_id)
+                    (t.retrieved_skill_ids, t.success, t.benchmark or None, t.task_id,
+                     extract_concepts(t.instruction))
                     for t in trajectories
                     if t.generation == generation and t.usable and t.retrieved_skill_ids
                 ],
@@ -103,6 +105,7 @@ class GenerationLearner:
                 created = self.skills.induce(this_gen, generation) if self.mine_skills else []
                 out["skills_created"] = len(created)
                 out["skills"] = {**self.skills.lifecycle(generation), **self.skills.stats()}
+                out["skills_refined"] = len(self.skills.refine(generation))
             except Exception as exc:  # noqa: BLE001
                 self.errors.append(f"skills: {exc!r}")
         self.history.append(out)

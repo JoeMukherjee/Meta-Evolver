@@ -68,7 +68,14 @@ class Edge:
 
     @property
     def confidence(self) -> float:
-        """Beta(1,1) posterior mean -- an unobserved edge sits at 0.5."""
+        """Beta(1,1) posterior mean -- an unobserved edge sits at 0.5.
+
+        A *derived* edge (see ``reasoner``) has no win/loss record of its own;
+        its confidence is the product of its premises', stored in props, so
+        chains of inference attenuate instead of laundering weak evidence.
+        """
+        if self.props.get("derived") and "confidence" in self.props:
+            return float(self.props["confidence"])
         return (self.wins + 1.0) / (self.uses + 2.0)
 
 
@@ -279,6 +286,11 @@ class KnowledgeGraph:
                 (src or e.src, dst or e.dst, rel or e.rel, edge_id),
             )
             self._db.commit()
+
+    def get_edge(self, edge_id: int) -> Edge | None:
+        """One edge by id, active or not (provenance chains outlive invalidation)."""
+        with self._lock:
+            return self._edge(edge_id)
 
     def _edge(self, edge_id: int) -> Edge | None:
         row = self._db.execute("SELECT * FROM edges WHERE id=?", (edge_id,)).fetchone()

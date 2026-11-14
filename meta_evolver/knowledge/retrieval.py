@@ -28,6 +28,10 @@ from meta_evolver.knowledge.graph import KnowledgeGraph, node_id
 from meta_evolver.knowledge.ingest import extract_concepts
 
 
+#: Concept-to-concept links that evidence may flow across.
+LIFT_RELS = ("similar_to", "is_a")
+
+
 @dataclass
 class Recommendation:
     kind: str  # "Memory" | "Skill"
@@ -41,6 +45,13 @@ class GraphMemory:
         self.graph = graph
         self.min_confidence = min_confidence
 
+    def _degree(self, nid: str) -> int:
+        """Degree over *asserted* edges only. Inferred (lifted) and derived
+        edges must not change a concept's specificity weight, or merely
+        running lifting/reasoning would perturb every recommendation, including
+        the ones with ``transfer`` off."""
+        return sum(1 for e, _ in self.graph.neighbors(nid) if not (e.props.get("inferred") or e.props.get("derived")))
+
     def recommend(
         self,
         instruction: str,
@@ -48,7 +59,16 @@ class GraphMemory:
         domain: str = "",
         exclude: Iterable[str] = (),
         k: int = 4,
+        transfer: bool = False,
+        transfer_decay: float = 0.5,
+        transfer_hops: int = 2,
     ) -> list[Recommendation]:
+        """``transfer=True`` (off by default, so behaviour is unchanged) also
+        borrows evidence from concepts *linked* to the task's concepts by
+        ``similar_to`` / ``is_a`` (see ``lifting``): a strategy that only won on
+        ``heat`` can then be found for a ``warm`` task. Each hop multiplies the
+        borrowed score by ``transfer_decay`` and by that link's confidence, so
+        borrowed evidence always ranks below the same evidence held directly."""
         g = self.graph
         skip = {node_id("Memory", x) for x in exclude} | {node_id("Skill", x) for x in exclude}
         scores: dict[str, float] = {}
@@ -65,10 +85,25 @@ class GraphMemory:
             if g.get_node(cid) is None:
                 continue
             # IDF-like weight: a concept touched by many nodes is less specific.
-            weight = 1.0 / math.log(2.0 + g.degree(cid))
+            weight = 1.0 / math.log(2.0 + self._degree(cid))
             for edge in g.edges(dst=cid, rel="applies_to"):
                 if edge.confidence >= self.min_confidence:
                     bump(edge.src, weight * edge.confidence, f"worked on tasks involving '{concept}'")
+
+            if transfer:
+                reach = g.traverse([cid], hops=transfer_hops, rels=LIFT_RELS, decay=transfer_decay)
+                for other, r in sorted(reach.items()):
+                    if other == cid:
+                        continue
+                    on = g.get_node(other)
+                    oname = on.name if on else other
+                    ow = 1.0 / math.log(2.0 + self._degree(other))
+                    for edge in g.edges(dst=other, rel="applies_to"):
+                        if edge.wins >= 1 and edge.confidence >= self.min_confidence:
+                            bump(
+                                edge.src, ow * edge.confidence * r.score,
+                                f"won on '{oname}', linked to '{concept}' ({r.distance} hop, x{r.score:.2f})",
+                            )
 
         if domain:
             did = node_id("Domain", domain)
